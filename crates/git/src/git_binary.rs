@@ -53,8 +53,27 @@ fn helper_exists_in_dir(dir: &Path) -> bool {
     // `GitBinary::build_command` security flags intentionally; needs a
     // blocking spawn in this sync selector.
     #[allow(clippy::disallowed_methods)]
-pub fn has_remote_https_helper(_path: &Path) -> bool {
-    true
+pub fn has_remote_https_helper(path: &Path) -> bool {
+    if let Ok(exec_path_override) = std::env::var("GIT_EXEC_PATH") {
+        if !exec_path_override.trim().is_empty()
+            && helper_exists_in_dir(Path::new(exec_path_override.trim()))
+        {
+            return true;
+        }
+    }
+    let output = std::process::Command::new(path).arg("--exec-path").output();
+    let output = match output {
+        Ok(output) => output,
+        Err(_) => return false,
+    };
+    if !output.status.success() {
+        return false;
+    }
+    let dir = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    if dir.is_empty() {
+        return false;
+    }
+    helper_exists_in_dir(Path::new(&dir))
 }
 
 /// Selects the git binary to use, preferring `system` over `bundled`.
