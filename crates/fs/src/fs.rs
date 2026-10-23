@@ -32,7 +32,10 @@ use std::mem::MaybeUninit;
 
 use async_tar::Archive;
 use futures::{AsyncRead, Stream, StreamExt, future::BoxFuture};
-use git::repository::{GitRepository, RealGitRepository, select_git_binary_with_info};
+use git::repository::{
+    GitRepository, RealGitRepository, is_usable_git, select_basic_git_binary_with_info,
+    select_git_binary_with_info,
+};
 #[cfg(windows)]
 use is_executable::IsExecutable;
 use rope::Rope;
@@ -588,15 +591,38 @@ impl RealFs {
             is_case_sensitive: Default::default(),
         })
     }
-    /// Validated selection via `select_git_binary_with_info`:
-    /// system (`PATH` `git`) if usable → bundled aux if usable → bail.
-    /// Usable = launches and ships `remote-https` helper. Fallback only on
-    /// missing/spawn/helper-missing; never on auth/network/non-zero exit.
+    /// Validated Basic selection via `select_basic_git_binary_with_info`:
+    /// system (`PATH` `git`) if spawns → bundled aux if spawns → bail.
+    /// Covers local ops (`init`/`config`, local-path/SSH clones) without the
+    /// `remote-https` helper. Fallback only on missing/spawn failure; never
+    /// on auth/network/non-zero exit.
     /// Constraint from #37757 (reverted by #37828): never pin clone/init to a
     /// bare `"git"` string nor to an unvalidated system path; every
-    /// `git_clone`/`git_init`/`git_config` spawn must go through this
-    /// resolver (see issue #57862 `git: 'remote-https' is not a git command`).
+    /// `git_clone`/`git_init`/`git_config` spawn must go through a resolver
+    /// (see issue #57862 `git: 'remote-https' is not a git command`).
     fn resolve_git_binary(&self) -> Result<(PathBuf, &'static str)> {
+        let system = which::which("git").ok();
+        let bundled = self.bundled_git_binary_path.clone();
+        match select_basic_git_binary_with_info(system, bundled) {
+            Ok(selected) => {
+                log::info!(
+                    "selected git binary {:?} source={} reason={}",
+                    selected.path,
+                    selected.source,
+                    selected.reason
+                );
+                Ok((selected.path, selected.source))
+            }
+            Err(e) => Err(e),
+        }
+    }
+
+    /// Validated HTTPS selection via `select_git_binary_with_info`:
+    /// system if it spawns and ships `git-remote-https` → bundled if so →
+    /// bail. Required for remote HTTPS ops (`https://`/`http://` clones,
+    /// `fetch`/`pull`/`push`). Fallback only on
+    /// missing/spawn/helper-missing; never on auth/network/non-zero exit.
+    fn resolve_https_git_binary(&self) -> Result<(PathBuf, &'static str)> {
         let system = which::which("git").ok();
         let bundled = self.bundled_git_binary_path.clone();
         match select_git_binary_with_info(system, bundled) {
@@ -613,9 +639,24 @@ impl RealFs {
         }
     }
 
-    fn fallback_git_binary(&self, primary_source: &str) -> Option<(PathBuf, &'static str)> {
+    fn fallback_basic_git_binary(&self, primary_source: &str) -> Option<(PathBuf, &'static str)> {
         // Primary was already validated; only a spawn race can land here.
-        // Retry only with the other candidate when it validates.
+        // Retry only with the other candidate when it spawns.
+        if primary_source == "system" {
+            let bundled = self.bundled_git_binary_path.clone()?;
+            if is_usable_git(&bundled) {
+                return Some((bundled, "bundled"));
+            }
+            None
+        } else {
+            None
+        }
+    }
+
+    fn fallback_https_git_binary(&self, primary_source: &str) -> Option<(PathBuf, &'static str)> {
+        // Primary was already validated; only a spawn race can land here.
+        // Retry only with the other candidate when it validates (Basic +
+        // helper).
         if primary_source == "system" {
             let bundled = self.bundled_git_binary_path.clone()?;
             if git::git_binary::has_remote_https_helper(&bundled) {
@@ -625,6 +666,14 @@ impl RealFs {
         } else {
             None
         }
+    }
+
+    /// True for clone URLs that require the HTTPS helper (`https://`,
+    /// `http://`); everything else (local paths, `ssh://`, `git@`, etc.)
+    /// works with a Basic-only binary.
+    fn clone_url_needs_https_helper(repo_url: &str) -> bool {
+        let lower = repo_url.trim_start().to_ascii_lowercase();
+        lower.starts_with("https://") || lower.starts_with("http://")
     }
 
     #[cfg(target_os = "windows")]
@@ -1308,7 +1357,7 @@ impl Fs for RealFs {
         // Fallback only on spawn failure; a non-zero exit (unset value) uses
         // `fallback_branch_name` without switching binaries.
         let result = match run_config_get(git_binary, work_dir.clone()).await {
-            Err(_) => match self.fallback_git_binary(source) {
+            Err(_) => match self.fallback_basic_git_binary(source) {
                 Some((fallback_binary, fallback_source)) => {
                     log::info!(
                         "selected git binary {:?} source={} reason=fallback-spawn-failure for git_init config",
@@ -1338,7 +1387,7 @@ impl Fs for RealFs {
             .output()
             .await
         {
-            Err(_) => match self.fallback_git_binary(source) {
+            Err(_) => match self.fallback_basic_git_binary(source) {
                 Some((fallback_binary, fallback_source)) => {
                     log::info!(
                         "selected git binary {:?} source={} reason=fallback-spawn-failure for git_init",
@@ -1370,7 +1419,15 @@ impl Fs for RealFs {
         };
 
         let job_tracker = JobTracker::new(job_info, self.job_event_subscribers.clone());
-        let (git_binary, source) = self.resolve_git_binary()?;
+        // HTTPS URLs require the helper; local paths, `ssh://`, `git@`, etc.
+        // work with a Basic-only binary. Spawn-failure retries with the other
+        // candidate only; non-zero exit (auth) never falls back.
+        let needs_https = Self::clone_url_needs_https_helper(repo_url);
+        let (git_binary, source) = if needs_https {
+            self.resolve_https_git_binary()?
+        } else {
+            self.resolve_git_binary()?
+        };
         // Fallback only on spawn failure; a non-zero exit (e.g. auth failure)
         // must surface without switching binaries.
         let mut child = match new_command(&git_binary)
@@ -1382,8 +1439,11 @@ impl Fs for RealFs {
             .spawn()
         {
             Err(_) => {
-                let (fallback_binary, fallback_source) = self
-                    .fallback_git_binary(source)
+                let (fallback_binary, fallback_source) = if needs_https {
+                    self.fallback_https_git_binary(source)
+                } else {
+                    self.fallback_basic_git_binary(source)
+                }
                     .context("failed to spawn git clone and no fallback binary")?;
                 log::info!(
                     "selected git binary {:?} source={} reason=fallback-spawn-failure for git_clone",
@@ -1433,7 +1493,7 @@ impl Fs for RealFs {
         {
             Err(_) => {
                 let (fallback_binary, fallback_source) = self
-                    .fallback_git_binary(source)
+                    .fallback_basic_git_binary(source)
                     .context("failed to spawn git config and no fallback binary")?;
                 log::info!(
                     "selected git binary {:?} source={} reason=fallback-spawn-failure for git_config",
