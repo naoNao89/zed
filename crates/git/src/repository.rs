@@ -43,8 +43,9 @@ use util::{ResultExt, paths};
 use uuid::Uuid;
 
 pub use crate::git_binary::{
-    SelectedGitBinary, has_remote_https_helper, is_usable_git, select_basic_git_binary,
-    select_basic_git_binary_with_info, select_git_binary, select_git_binary_with_info,
+    SelectedGitBinary, has_remote_https_helper, has_remote_https_helper_with_env, is_usable_git,
+    select_basic_git_binary, select_basic_git_binary_with_info, select_git_binary,
+    select_git_binary_with_info,
 };
 pub use askpass::{AskPassDelegate, AskPassResult, AskPassSession};
 
@@ -1182,7 +1183,13 @@ pub struct RealGitRepository {
     pub common_dir: PathBuf,
     /// `None` only for bare repositories, which do not have a working directory.
     pub working_directory: Option<PathBuf>,
+    /// Primary system git (login-shell `PATH` via `which_in`). First in the
+    /// ordered fallback chain: primary → secondary → bundled.
     pub system_git_binary_path: Option<PathBuf>,
+    /// Secondary system git (process `PATH` via `which("git")`). Tried when
+    /// the primary is missing, fails to spawn, or (for HTTPS) lacks the
+    /// `remote-https` helper — never dropped by Basic validation.
+    pub secondary_system_git_binary_path: Option<PathBuf>,
     pub bundled_git_binary_path: Option<PathBuf>,
     pub any_git_binary_path: PathBuf,
     /// Validated HTTPS-capable binary for remote ops (`fetch`/`pull`/`push`
@@ -1222,6 +1229,128 @@ impl RefEdit {
     }
 }
 
+/// Capability a remote URL needs: a plain spawning `git` (Basic) or one
+/// shipping the `remote-https` helper (Https).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum RemoteCapability {
+    Basic,
+    Https,
+}
+
+/// Ordered candidates: primary (login-shell `PATH`) → secondary (process
+/// `PATH`) → bundled, dropping `None`s and duplicates so each path is probed
+/// at most once. Fallback everywhere follows this order, and only on
+/// missing/spawn/helper-missing — never on auth/network/non-zero remote exit.
+fn ordered_git_candidates(
+    primary: Option<PathBuf>,
+    secondary: Option<PathBuf>,
+    bundled: Option<PathBuf>,
+) -> Vec<(PathBuf, &'static str)> {
+    let mut out = Vec::with_capacity(3);
+    for (candidate, source) in [
+        (primary, "system"),
+        (secondary, "system"),
+        (bundled, "bundled"),
+    ] {
+        if let Some(path) = candidate {
+            if !out.iter().any(|(existing, _)| existing == &path) {
+                out.push((path, source));
+            }
+        }
+    }
+    out
+}
+
+/// First candidate that spawns (`is_usable_git`), with provenance for
+/// `source=… reason=…` logs. `reason` is `validated-basic` for the first
+/// candidate, `fallback-basic` once a later one is needed.
+fn select_basic_candidate(
+    candidates: &[(PathBuf, &'static str)],
+) -> Option<(PathBuf, &'static str, &'static str)> {
+    for (index, (path, source)) in candidates.iter().enumerate() {
+        if is_usable_git(path) {
+            let reason = if index == 0 {
+                "validated-basic"
+            } else {
+                "fallback-basic"
+            };
+            return Some((path.clone(), *source, reason));
+        }
+    }
+    None
+}
+
+/// First candidate shipping `git-remote-https`, probed with `env` — the
+/// environment the remote command will run with, so probe and execution
+/// observe the same effective `GIT_EXEC_PATH`. `reason` is `validated` for
+/// the first candidate, `fallback-missing-helper` once a later one is needed.
+fn select_https_candidate(
+    candidates: &[(PathBuf, &'static str)],
+    env: Option<&HashMap<String, String>>,
+) -> Option<(PathBuf, &'static str, &'static str)> {
+    for (index, (path, source)) in candidates.iter().enumerate() {
+        if has_remote_https_helper_with_env(path, env) {
+            let reason = if index == 0 {
+                "validated"
+            } else {
+                "fallback-missing-helper"
+            };
+            return Some((path.clone(), *source, reason));
+        }
+    }
+    None
+}
+
+/// Classifies the effective remote URL: `https://`/`http://` need the HTTPS
+/// helper; SSH (`ssh://`, `git@`, scp-like `[user@]host:path`), local paths
+/// (`/…`, `./…`, `../…`, `file://`, Windows drive/UNC) work with a
+/// Basic-only binary. Anything unrecognized is HTTPS (strict): handing an
+/// unknown URL to a helper-less binary would reintroduce the original
+/// `git: 'remote-https' is not a git command` failure.
+fn classify_remote_url(url: &str) -> RemoteCapability {
+    let trimmed = url.trim();
+    let lower = trimmed.to_ascii_lowercase();
+    if lower.starts_with("https://") || lower.starts_with("http://") {
+        return RemoteCapability::Https;
+    }
+    if lower.starts_with("ssh://") || lower.starts_with("git@") || lower.starts_with("file://") {
+        return RemoteCapability::Basic;
+    }
+    let bytes = trimmed.as_bytes();
+    let is_local_path = trimmed.starts_with('/')
+        || trimmed.starts_with("./")
+        || trimmed.starts_with("../")
+        || trimmed == "."
+        || trimmed == ".."
+        || trimmed.starts_with(".\\")
+        || trimmed.starts_with("..\\")
+        || trimmed.starts_with('\\')
+        || (bytes.len() == 2 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':')
+        || (bytes.len() > 2
+            && bytes[0].is_ascii_alphabetic()
+            && bytes[1] == b':'
+            && (bytes[2] == b'\\' || bytes[2] == b'/'));
+    if is_local_path {
+        return RemoteCapability::Basic;
+    }
+    // scp-like `[user@]host:path` (no `://`; the colon separates a host part
+    // without slashes/spaces). Checked after Windows drive paths (`C:\…`),
+    // which also contain a colon.
+    if !trimmed.contains("://") {
+        if let Some(colon) = trimmed.find(':') {
+            let host = &trimmed[..colon];
+            if !host.is_empty()
+                && !host.contains('/')
+                && !host.contains('\\')
+                && !host.contains(' ')
+            {
+                return RemoteCapability::Basic;
+            }
+        }
+    }
+    RemoteCapability::Https
+}
+
 impl RealGitRepository {
     pub fn new(
         dotgit_path: &Path,
@@ -1229,41 +1358,67 @@ impl RealGitRepository {
         system_git_binary_path: Option<PathBuf>,
         executor: BackgroundExecutor,
     ) -> Result<Self> {
-        // Basic (local ops): binary spawns. Usable without `git-remote-https`,
-        // so `init`/`config`/`status`/local-path work with a minimal git.
-        // Fallback only on missing/spawn failure, never on auth/network.
-        let basic_selected = select_basic_git_binary_with_info(
+        Self::new_with_secondary(
+            dotgit_path,
+            bundled_git_binary_path,
+            system_git_binary_path,
+            None,
+            executor,
+        )
+    }
+
+    /// `new` plus an explicit secondary system candidate (process `PATH` via
+    /// `which("git")`, computed by the caller — typically `RealFs::open_repo`).
+    ///
+    /// Ordered fallback chain (never reordered): login-shell `PATH` git
+    /// (`system_git_binary_path`) → process-`PATH` git
+    /// (`secondary_system_git_binary_path`) → bundled. Basic validation must
+    /// NOT drop the secondary candidate: an HTTPS op may still need it when
+    /// the primary is Basic-usable but `remote-https`-incapable.
+    pub fn new_with_secondary(
+        dotgit_path: &Path,
+        bundled_git_binary_path: Option<PathBuf>,
+        system_git_binary_path: Option<PathBuf>,
+        secondary_system_git_binary_path: Option<PathBuf>,
+        executor: BackgroundExecutor,
+    ) -> Result<Self> {
+        // Deduped so identical paths are probed once.
+        let candidates = ordered_git_candidates(
             system_git_binary_path.clone(),
+            secondary_system_git_binary_path.clone(),
             bundled_git_binary_path.clone(),
-        )?;
-        let any_git_binary_path = basic_selected.path;
+        );
+        // Basic (local ops): binary spawns. Usable without `git-remote-https`,
+        // so `init`/`config`/`status`/local-path/SSH work with a minimal git.
+        // Fallback only on missing/spawn failure, never on auth/network.
+        let (any_git_binary_path, basic_source, basic_reason) =
+            select_basic_candidate(&candidates).ok_or_else(|| {
+                anyhow!(
+                    "no usable git binary found (tried system={system_git_binary_path:?}, \
+                    secondary={secondary_system_git_binary_path:?}, \
+                    bundled={bundled_git_binary_path:?}): each candidate is missing or \
+                    failed to spawn. Install git or bundle one."
+                )
+            })?;
         log::info!(
-            "opening git repository at {dotgit_path:?} using git binary {any_git_binary_path:?} source={} reason={}",
-            basic_selected.source,
-            basic_selected.reason,
+            "opening git repository at {dotgit_path:?} using git binary {any_git_binary_path:?} source={basic_source} reason={basic_reason}",
         );
         // HTTPS (remote ops): Basic + `git-remote-https` helper. Resolved
-        // eagerly so `push`/`pull`/`fetch` never use a helper-less binary
+        // eagerly so HTTPS `push`/`pull`/`fetch` never use a helper-less binary
         // (see issue #57862). `None` when no candidate has the helper;
         // local ops still succeed via `any_git_binary_path`.
-        let https_git_binary_path = match select_git_binary_with_info(
-            system_git_binary_path.clone(),
-            bundled_git_binary_path.clone(),
-        ) {
-            Ok(selected) => {
+        let https_git_binary_path = match select_https_candidate(&candidates, None) {
+            Some((path, source, reason)) => {
                 // Log only when the HTTPS choice differs, keeping the opening
                 // line above as the agreement point for store/fs/main logs.
-                if selected.path != any_git_binary_path {
+                if path != any_git_binary_path {
                     log::info!(
-                        "selected HTTPS git binary {:?} source={} reason={} for repository at {dotgit_path:?}",
-                        selected.path,
-                        selected.source,
-                        selected.reason,
+                        "selected HTTPS git binary {path:?} source={source} reason={reason} for repository at {dotgit_path:?}",
                     );
                 }
-                Some(selected.path)
+                Some(path)
             }
-            Err(_) => None,
+            None => None,
         };
         let dotgit_parent = dotgit_path.parent().context(".git has no parent")?;
         let has_working_directory =
@@ -1315,6 +1470,7 @@ impl RealGitRepository {
             common_dir,
             working_directory,
             system_git_binary_path,
+            secondary_system_git_binary_path,
             bundled_git_binary_path,
             any_git_binary_path,
             https_git_binary_path,
@@ -1355,32 +1511,83 @@ impl RealGitRepository {
             self.is_trusted(),
         )
     }
-    /// Validated binary for remote ops (`push`/`pull`/`fetch`) plus a
-    /// precomputed `tried ...` hint for error messages.
-    ///
-    /// The path is `https_git_binary_path` when present (system with
-    /// `remote-https` helper, else bundled, resolved at construction via
-    /// `select_git_binary`). Local-only binaries (Basic without helper) are
-    /// never used here. When no HTTPS-capable binary exists, re-resolves via
-    /// `select_git_binary_with_info` to surface its standard
-    /// `no usable git binary ...` error naming the tried paths.
-    /// Remote-command failures (auth/network/non-zero exit) must never trigger
-    /// a fallback to the other binary, so callers use the returned path directly.
-    fn remote_git_binary(&self) -> Result<(PathBuf, String)> {
-        let tried = || {
-            format!(
-                "tried system={:?}, bundled={:?}",
-                self.system_git_binary_path, self.bundled_git_binary_path
-            )
-        };
+    /// `tried ...` hint naming every candidate in fallback order, for error messages.
+    fn tried_binaries(&self) -> String {
+        format!(
+            "tried system={:?}, secondary={:?}, bundled={:?}",
+            self.system_git_binary_path,
+            self.secondary_system_git_binary_path,
+            self.bundled_git_binary_path
+        )
+    }
+    /// HTTPS binary for remote ops plus the `tried ...` hint. The eager
+    /// `https_git_binary_path` (resolved at construction) is preferred when it
+    /// still validates under `env`; otherwise the ordered candidates are
+    /// re-probed with `env` so the probe and the spawned remote command
+    /// observe the same effective `GIT_EXEC_PATH`. Errors name the tried
+    /// paths. A launched remote command's non-zero exit (auth/network) must
+    /// never trigger a fallback to another binary, so callers use the returned
+    /// path for a single attempt.
+    fn https_binary_with_env(
+        &self,
+        env: Option<&HashMap<String, String>>,
+    ) -> Result<(PathBuf, String)> {
+        let tried = self.tried_binaries();
         if let Some(path) = self.https_git_binary_path.clone() {
-            return Ok((path, tried()));
+            if has_remote_https_helper_with_env(&path, env) {
+                return Ok((path, tried));
+            }
         }
-        let selected = select_git_binary_with_info(
+        let candidates = ordered_git_candidates(
             self.system_git_binary_path.clone(),
+            self.secondary_system_git_binary_path.clone(),
             self.bundled_git_binary_path.clone(),
-        )?;
-        Ok((selected.path, tried()))
+        );
+        if let Some((path, _source, _reason)) = select_https_candidate(&candidates, env) {
+            return Ok((path, tried));
+        }
+        anyhow::bail!(
+            "no usable git binary found ({tried}): each candidate is missing, failed to \
+            spawn, or lacks the `remote-https` helper (git: 'remote-https' is not a git \
+            command). Install a git with HTTPS support or bundle one."
+        );
+    }
+    /// Effective URL of `remote_name` via the Basic binary
+    /// (`git remote get-url [--push] <name>`), which honors `pushurl` and
+    /// `url.insteadOf`. `None` when the remote is unresolvable (missing remote
+    /// or non-zero exit) — callers treat that as HTTPS (strict).
+    async fn effective_remote_url(&self, remote_name: &str, for_push: bool) -> Option<String> {
+        let git = self.git_binary();
+        let output = if for_push {
+            git.run(&["remote", "get-url", "--push", remote_name]).await
+        } else {
+            git.run(&["remote", "get-url", remote_name]).await
+        }
+        .ok()?;
+        let url = output.trim().to_string();
+        if url.is_empty() { None } else { Some(url) }
+    }
+    /// Binary for a remote op against `remote_name`, chosen by the remote's
+    /// capability: SSH/local remotes run on the Basic binary
+    /// (`any_git_binary_path`, which spawns without the helper); `https://`
+    /// /`http://` — and unresolvable/unknown URLs (strict) — run on the HTTPS
+    /// binary re-selected with `env`. Single attempt: a non-zero remote exit
+    /// (auth/network) surfaces without switching binaries.
+    async fn remote_binary_for(
+        &self,
+        remote_name: &str,
+        for_push: bool,
+        env: &HashMap<String, String>,
+    ) -> Result<(PathBuf, String)> {
+        let capability = self
+            .effective_remote_url(remote_name, for_push)
+            .await
+            .map(|url| classify_remote_url(&url))
+            .unwrap_or(RemoteCapability::Https);
+        if capability == RemoteCapability::Basic {
+            return Ok((self.any_git_binary_path.clone(), self.tried_binaries()));
+        }
+        self.https_binary_with_env(Some(env))
     }
 
     fn edit_ref(&self, edit: RefEdit) -> BoxFuture<'_, Result<()>> {
@@ -1436,9 +1643,9 @@ pub async fn get_git_committer(cx: &AsyncApp) -> GitCommitter {
     }
 
     // Basic is enough: committer only reads local/global `config`.
-    // Single resolution order (system-validated → bundled), matching
-    // `select_basic_git_binary` used by `RealGitRepository::new` (Basic part)
-    // and the `LocalRepositoryState`/`RealFs` callsites.
+    // Single resolution order (system-validated → bundled), matching the
+    // Basic part of `RealGitRepository::new_with_secondary` and the
+    // `LocalRepositoryState`/`RealFs` callsites.
     // Constraint from #37757 (reverted by #37828): never pin to a bare
     // `"git"` string nor to an unvalidated system path; each candidate must
     // spawn (`is_usable_git`; missing/spawn falls back, never
@@ -2951,16 +3158,18 @@ impl GitRepository for RealGitRepository {
         let working_directory = self.command_directory();
         let git_directory = self.path();
         let executor = cx.background_executor().clone();
-        // HTTPS binary resolved at construction (`https_git_binary_path`):
-        // system with `remote-https` helper, else bundled. Local-only
-        // (Basic) binaries are never used here. Never fall back on
-        // auth/network failures below.
-        let remote = self.remote_git_binary();
+        // Capability routing (see `remote_binary_for`): the effective remote
+        // URL is resolved with the Basic binary first (`get-url --push`
+        // honors pushurl/insteadOf). SSH/local remotes run on the Basic
+        // binary and never demand `git-remote-https`; HTTPS (or
+        // unresolvable) remotes run on the HTTPS binary. Single attempt —
+        // never fall back on auth/network failures below.
         let is_trusted = self.is_trusted();
         // Note: Do not spawn this command on the background thread, it might pop open the credential helper
         // which we want to block on.
         async move {
-            let (git_binary_path, tried_binaries) = remote?;
+            let (git_binary_path, tried_binaries) =
+                self.remote_binary_for(&remote_name, true, &env).await?;
             let git = GitBinary::new(
                 git_binary_path.clone(),
                 working_directory,
@@ -3004,13 +3213,16 @@ impl GitRepository for RealGitRepository {
         let working_directory = self.command_directory();
         let git_directory = self.path();
         let executor = cx.background_executor().clone();
-        // HTTPS binary (see `push`).
-        let remote = self.remote_git_binary();
+        // Capability routing (see `push`): the effective remote URL is
+        // resolved with the Basic binary first (`get-url` honors
+        // insteadOf). SSH/local remotes use the Basic binary; HTTPS (or
+        // unresolvable) remotes use the HTTPS binary. Single attempt.
         let is_trusted = self.is_trusted();
         // Note: Do not spawn this command on the background thread, it might pop open the credential helper
         // which we want to block on.
         async move {
-            let (git_binary_path, tried_binaries) = remote?;
+            let (git_binary_path, tried_binaries) =
+                self.remote_binary_for(&remote_name, false, &env).await?;
             let git = GitBinary::new(
                 git_binary_path.clone(),
                 working_directory,
@@ -3052,14 +3264,25 @@ impl GitRepository for RealGitRepository {
         let working_directory = self.command_directory();
         let git_directory = self.path();
         let remote_name = format!("{}", fetch_options);
-        // HTTPS binary (see `push`).
-        let remote = self.remote_git_binary();
+        // `FetchOptions::Remote` names the remote to route by; `--all` /
+        // `--unshallow` name no single remote, so they stay on the HTTPS
+        // binary (strict, like unresolvable URLs).
+        let routing_remote = match &fetch_options {
+            FetchOptions::Remote(remote) => Some(remote.name.to_string()),
+            FetchOptions::All | FetchOptions::Unshallow => None,
+        };
         let executor = cx.background_executor().clone();
         let is_trusted = self.is_trusted();
         // Note: Do not spawn this command on the background thread, it might pop open the credential helper
         // which we want to block on.
         async move {
-            let (git_binary_path, tried_binaries) = remote?;
+            let env_map: &HashMap<String, String> = &env;
+            let (git_binary_path, tried_binaries) = match &routing_remote {
+                Some(remote_name) => {
+                    self.remote_binary_for(remote_name, false, env_map).await?
+                }
+                None => self.https_binary_with_env(Some(env_map))?,
+            };
             let git = GitBinary::new(
                 git_binary_path.clone(),
                 working_directory,
@@ -7590,5 +7813,241 @@ mod tests {
             !bundled_invoked.exists(),
             "bundled git must not be invoked after an auth/network failure"
         );
+    }
+    /// SSH remotes run on a Basic-only git: `fetch` resolves the effective
+    /// URL (`git remote get-url` honors insteadOf/pushurl) and routes SSH to
+    /// the spawning system binary instead of demanding `git-remote-https`.
+    #[cfg(unix)]
+    #[gpui::test]
+    async fn test_ssh_fetch_with_basic_git(cx: &mut TestAppContext) {
+        cx.executor().allow_parking();
+        let temp = tempfile::tempdir().unwrap();
+        // Helper-less system stub: spawns (`--version` OK) but ships no
+        // `git-remote-https`. Its remote answers an SSH URL.
+        let system_invoked = temp.path().join("system_fetch_invoked");
+        let system = write_stub_git(
+            temp.path(),
+            "system-git",
+            false,
+            &format!(
+                "for a in \"$@\"; do if [ \"$a\" = \"get-url\" ]; then echo \"git@github.com:example/project.git\"; exit 0; fi; done\nif [ \"$1\" = \"remote\" ]; then echo \"git@github.com:example/project.git\"; exit 0; fi\ntouch \"{}\"; exit 0",
+                system_invoked.display()
+            ),
+        );
+        // Healthy bundled stub records any invocation; an SSH fetch must not
+        // need it.
+        let bundled_invoked = temp.path().join("bundled_fetch_invoked");
+        let bundled = write_stub_git(
+            temp.path(),
+            "bundled-git",
+            true,
+            &format!("touch \"{}\"; exit 0", bundled_invoked.display()),
+        );
+        let dotgit = empty_dot_git(&temp.path().join("repo"));
+        let repo = RealGitRepository::new_with_secondary(
+            &dotgit,
+            Some(bundled),
+            Some(system.clone()),
+            None,
+            cx.executor(),
+        )
+        .unwrap();
+        assert_eq!(repo.any_git_binary_path, system);
+
+        repo.fetch(
+            FetchOptions::Remote(Remote {
+                name: "origin".to_string().into(),
+            }),
+            AskPassDelegate::new(&mut cx.to_async(), |_, _, _| {}),
+            Arc::new(test_commit_envs()),
+            cx.to_async(),
+        )
+        .await
+        .unwrap();
+        assert!(
+            system_invoked.exists(),
+            "SSH fetch must run on the Basic system git"
+        );
+        assert!(
+            !bundled_invoked.exists(),
+            "SSH fetch must not demand the HTTPS helper binary"
+        );
+    }
+
+    /// The process-`PATH` candidate is not dropped when the login-shell git
+    /// is Basic-usable but HTTPS-incapable: HTTPS ops fall through to the
+    /// second system git before the bundled one.
+    #[cfg(unix)]
+    #[gpui::test]
+    async fn test_https_uses_second_system_candidate(cx: &mut TestAppContext) {
+        cx.executor().allow_parking();
+        let temp = tempfile::tempdir().unwrap();
+        // Login-shell candidate: spawns but ships no `git-remote-https`.
+        let primary = write_stub_git(temp.path(), "primary-git", false, "exit 0");
+        // Process-`PATH` candidate: healthy (spawns + helper). Records fetches.
+        let secondary_invoked = temp.path().join("secondary_fetch_invoked");
+        let secondary = write_stub_git(
+            temp.path(),
+            "secondary-git",
+            true,
+            &format!("touch \"{}\"; exit 0", secondary_invoked.display()),
+        );
+        // Bundled is healthy too but must stay untouched.
+        let bundled_invoked = temp.path().join("bundled_fetch_invoked");
+        let bundled = write_stub_git(
+            temp.path(),
+            "bundled-git",
+            true,
+            &format!("touch \"{}\"; exit 0", bundled_invoked.display()),
+        );
+        let dotgit = empty_dot_git(&temp.path().join("repo"));
+        let repo = RealGitRepository::new_with_secondary(
+            &dotgit,
+            Some(bundled),
+            Some(primary.clone()),
+            Some(secondary.clone()),
+            cx.executor(),
+        )
+        .unwrap();
+        // Basic keeps the helper-less primary for local ops ...
+        assert_eq!(repo.any_git_binary_path, primary);
+        // ... while HTTPS falls through to the secondary process-`PATH` git.
+        assert_eq!(repo.https_git_binary_path.as_ref(), Some(&secondary));
+
+        repo.fetch(
+            FetchOptions::Remote(Remote {
+                name: "origin".to_string().into(),
+            }),
+            AskPassDelegate::new(&mut cx.to_async(), |_, _, _| {}),
+            Arc::new(test_commit_envs()),
+            cx.to_async(),
+        )
+        .await
+        .unwrap();
+        assert!(
+            secondary_invoked.exists(),
+            "HTTPS fetch must run on the second system candidate"
+        );
+        assert!(
+            !bundled_invoked.exists(),
+            "bundled must stay untouched when the second system git is HTTPS-capable"
+        );
+    }
+
+    /// The HTTPS probe and the remote command observe the same environment:
+    /// a `GIT_EXEC_PATH` present only in the command env is honored, and a
+    /// bogus one validates nothing.
+    #[cfg(unix)]
+    #[test]
+    fn test_probe_respects_command_environment() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let temp = tempfile::tempdir().unwrap();
+        // Stub whose own `--exec-path` directory has NO helper ...
+        let stub = write_stub_git(temp.path(), "env-git", false, "exit 0");
+        // ... while the command environment points at a directory that does.
+        let helper_dir = temp.path().join("helpers");
+        std::fs::create_dir_all(&helper_dir).unwrap();
+        let helper = helper_dir.join("git-remote-https");
+        std::fs::write(&helper, "#!/bin/sh\nexit 0\n").unwrap();
+        std::fs::set_permissions(&helper, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let mut env = HashMap::default();
+        env.insert(
+            "GIT_EXEC_PATH".to_string(),
+            helper_dir.to_string_lossy().to_string(),
+        );
+        // Command-env override honored even though the binary's own exec dir
+        // lacks the helper ...
+        assert!(has_remote_https_helper_with_env(&stub, Some(&env)));
+        // ... and the ordered selection (probe + execution share `env`) picks it.
+        let candidates = ordered_git_candidates(Some(stub.clone()), None, None);
+        let selected =
+            select_https_candidate(&candidates, Some(&env)).expect("env override must validate");
+        assert_eq!(selected.0, stub);
+        // A bogus override directory validates nothing.
+        let mut bad_env = HashMap::default();
+        bad_env.insert(
+            "GIT_EXEC_PATH".to_string(),
+            temp.path()
+                .join("does-not-exist")
+                .to_string_lossy()
+                .to_string(),
+        );
+        assert!(!has_remote_https_helper_with_env(&stub, Some(&bad_env)));
+        assert!(select_https_candidate(&candidates, Some(&bad_env)).is_none());
+    }
+
+    /// A git that spawns but lacks `git-remote-https` still opens for local
+    /// ops (`init`/`config`-equivalent selection); only the HTTPS selector
+    /// errors, and remote ops surface `no usable git binary` without running
+    /// the helper-less binary for the remote transport.
+    #[cfg(unix)]
+    #[gpui::test]
+    async fn test_basic_git_without_https_helper(cx: &mut TestAppContext) {
+        cx.executor().allow_parking();
+        let temp = tempfile::tempdir().unwrap();
+        let system = write_stub_git(temp.path(), "system-git", false, "exit 0");
+        let dotgit = empty_dot_git(&temp.path().join("repo"));
+        let repo = RealGitRepository::new_with_secondary(
+            &dotgit,
+            None,
+            Some(system.clone()),
+            None,
+            cx.executor(),
+        )
+        .expect("Basic-only git must open for local ops");
+        assert_eq!(repo.any_git_binary_path, system);
+        assert_eq!(repo.https_git_binary_path, None);
+        let candidates = ordered_git_candidates(Some(system), None, None);
+        assert!(select_basic_candidate(&candidates).is_some());
+        assert!(select_https_candidate(&candidates, None).is_none());
+
+        let err = repo
+            .fetch(
+                FetchOptions::Remote(Remote {
+                    name: "origin".to_string().into(),
+                }),
+                AskPassDelegate::new(&mut cx.to_async(), |_, _, _| {}),
+                Arc::new(test_commit_envs()),
+                cx.to_async(),
+            )
+            .await
+            .unwrap_err();
+        let message = format!("{err:#}");
+        assert!(
+            message.contains("no usable git binary"),
+            "unexpected error: {message}"
+        );
+    }
+
+    /// Pins the remote-URL routing table: HTTPS(S) URLs need the helper,
+    /// SSH/scp-like/local paths work Basic-only, anything else is HTTPS
+    /// (strict, so an unknown transport never hits a helper-less binary).
+    #[test]
+    fn test_classify_remote_url() {
+        use RemoteCapability::{Basic, Https};
+        assert_eq!(
+            classify_remote_url("https://github.com/zed-industries/zed.git"),
+            Https
+        );
+        assert_eq!(classify_remote_url("http://example.com/repo.git"), Https);
+        assert_eq!(
+            classify_remote_url("ssh://git@github.com/zed-industries/zed.git"),
+            Basic
+        );
+        assert_eq!(
+            classify_remote_url("git@github.com:zed-industries/zed.git"),
+            Basic
+        );
+        assert_eq!(classify_remote_url("user@host.xz:path/to/repo.git"), Basic);
+        assert_eq!(classify_remote_url("host.xz:path/to/repo.git"), Basic);
+        assert_eq!(classify_remote_url("/srv/git/repo.git"), Basic);
+        assert_eq!(classify_remote_url("./relative/repo.git"), Basic);
+        assert_eq!(classify_remote_url("../sibling/repo.git"), Basic);
+        assert_eq!(classify_remote_url("file:///srv/git/repo.git"), Basic);
+        assert_eq!(classify_remote_url("C:\\repos\\proj.git"), Basic);
+        assert_eq!(classify_remote_url("C:/repos/proj.git"), Basic);
+        assert_eq!(classify_remote_url("mystery-transport://odd"), Https);
+        assert_eq!(classify_remote_url(""), Https);
+        assert_eq!(classify_remote_url("   "), Https);
     }
 }

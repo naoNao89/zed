@@ -792,9 +792,16 @@ impl LocalRepositoryState {
                     // `which_in(search_paths)` + `which("git")` behavior, only
                     // add validation + bundled fallback. Do not re-pin
                     // fetch/push/pull to a raw `"git"` string or to an
-                    // unvalidated system path. Basic (spawn) validation here;
-                    // HTTPS helper is resolved inside `RealGitRepository::new`
-                    // for remote ops (see issue #57862
+                    // unvalidated system path.
+                    //
+                    // Ordered candidates (never reordered): login-shell git
+                    // (`primary`) → process-PATH git (`secondary`) → bundled.
+                    // The secondary is NOT dropped when the primary is
+                    // Basic-usable: an HTTPS op may still need it when the
+                    // primary lacks the `remote-https` helper.
+                    // `RealFs::open_repo` re-resolves the process-PATH
+                    // secondary and `RealGitRepository` tries it before the
+                    // bundled binary for HTTPS (see issue #57862
                     // `git: 'remote-https' is not a git command`).
                     let primary = search_paths
                         .and_then(|search_paths| {
@@ -802,40 +809,47 @@ impl LocalRepositoryState {
                                 .ok()
                         });
                     let secondary = which::which("git").ok();
-                    // 3-tier validated order: login-shell git if usable, else
-                    // process-PATH git if usable, else bundled if usable.
+                    // 3-tier Basic validation for the agreement log (plus an
+                    // early error when nothing spawns): login-shell if usable,
+                    // else process-PATH if usable, else bundled if usable.
                     // Usable = spawns (`is_usable_git`); fallback only on
                     // missing/spawn, never auth/network/non-zero. No helper
                     // check: local ops and SSH clones work without it.
-                    let system_git_binary_path = if let Some(ref candidate) = primary {
-                        if git::repository::is_usable_git(candidate) {
-                            primary
-                        } else {
-                            secondary.filter(|candidate| {
-                                git::repository::is_usable_git(candidate)
-                            })
+                    let ordered = [
+                        (primary.clone(), "system"),
+                        (secondary.clone(), "system"),
+                        (bundled_git_binary_path.clone(), "bundled"),
+                    ];
+                    let mut selected: Option<(PathBuf, &'static str, &'static str)> = None;
+                    for (index, (candidate, source)) in ordered.iter().enumerate() {
+                        if let Some(path) = candidate {
+                            if git::repository::is_usable_git(path) {
+                                let reason = if index == 0 {
+                                    "validated-basic"
+                                } else {
+                                    "fallback-basic"
+                                };
+                                selected = Some((path.clone(), *source, reason));
+                                break;
+                            }
                         }
-                    } else {
-                        secondary.filter(|candidate| {
-                            git::repository::is_usable_git(candidate)
-                        })
+                    }
+                    let Some((selected_path, selected_source, selected_reason)) = selected
+                    else {
+                        bail!(
+                            "no usable git binary found (tried login-shell={primary:?}, \
+                            process-PATH={secondary:?}, bundled={bundled_git_binary_path:?}): \
+                            each candidate is missing or failed to spawn."
+                        );
                     };
-                    // Validated Basic selection: system if usable → bundled if usable → bail.
-                    // `select_basic_git_binary_with_info` re-validates, so this log
-                    // agrees with `RealGitRepository::new` (`opening git
-                    // repository ... using git binary ... source= reason=`).
-                    let selected = git::repository::select_basic_git_binary_with_info(
-                        system_git_binary_path.clone(),
-                        bundled_git_binary_path.clone(),
-                    )?;
                     log::info!(
                         "opening git repository at {:?} using git binary {:?} source={} reason={}",
                         dot_git_abs_path,
-                        selected.path,
-                        selected.source,
-                        selected.reason
+                        selected_path,
+                        selected_source,
+                        selected_reason
                     );
-                    fs.open_repo(&dot_git_abs_path, system_git_binary_path.as_deref())
+                    fs.open_repo(&dot_git_abs_path, primary.as_deref())
                         .with_context(|| format!("opening repository at {dot_git_abs_path:?}"))
                 }
             })

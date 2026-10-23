@@ -36,6 +36,7 @@ use git::repository::{
     GitRepository, RealGitRepository, is_usable_git, select_basic_git_binary_with_info,
     select_git_binary_with_info,
 };
+use git::git_binary::has_remote_https_helper_with_env;
 #[cfg(windows)]
 use is_executable::IsExecutable;
 use rope::Rope;
@@ -656,10 +657,11 @@ impl RealFs {
     fn fallback_https_git_binary(&self, primary_source: &str) -> Option<(PathBuf, &'static str)> {
         // Primary was already validated; only a spawn race can land here.
         // Retry only with the other candidate when it validates (Basic +
-        // helper).
+        // helper, probed with the process environment — the same env a
+        // re-spawned clone would run with).
         if primary_source == "system" {
             let bundled = self.bundled_git_binary_path.clone()?;
-            if git::git_binary::has_remote_https_helper(&bundled) {
+            if has_remote_https_helper_with_env(&bundled, None::<&std::collections::HashMap<String, String>>) {
                 return Some((bundled, "bundled"));
             }
             None
@@ -1329,10 +1331,20 @@ impl Fs for RealFs {
         dotgit_path: &Path,
         system_git_binary_path: Option<&Path>,
     ) -> Result<Arc<dyn GitRepository>> {
-        Ok(Arc::new(RealGitRepository::new(
+        // `system_git_binary_path` is the login-shell `PATH` git (primary,
+        // `which_in`). The process-`PATH` git (`which("git")`) is the ordered
+        // secondary so HTTPS ops still try it when the primary is
+        // Basic-usable but helper-less — never dropped by Basic validation.
+        // Order kept: `which_in` (caller) → `which` (here) → bundled.
+        let primary = system_git_binary_path.map(|path| path.to_path_buf());
+        let secondary = which::which("git")
+            .ok()
+            .filter(|path| primary.as_ref() != Some(path));
+        Ok(Arc::new(RealGitRepository::new_with_secondary(
             dotgit_path,
             self.bundled_git_binary_path.clone(),
-            system_git_binary_path.map(|path| path.to_path_buf()),
+            primary,
+            secondary,
             self.executor.clone(),
         )?))
     }

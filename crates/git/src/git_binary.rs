@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Result, bail};
@@ -56,11 +57,42 @@ fn helper_exists_in_dir(dir: &Path) -> bool {
 // blocking spawn in this sync selector.
 #[allow(clippy::disallowed_methods)]
 pub fn has_remote_https_helper(path: &Path) -> bool {
+    has_remote_https_helper_with_env(path, None::<&HashMap<String, String>>)
+}
+
+/// Env-aware [`has_remote_https_helper`]: identical probe, but the effective
+/// `GIT_EXEC_PATH` is the `env` map value when present, else the process
+/// environment. Pass the same env the git execution will use so the probe
+/// and the spawned remote command observe the same override directory.
+///
+/// Spawns `git --exec-path` FIRST with that env (the binary must exist and
+/// run); returns false on missing binary, spawn failure, non-zero exit, or
+/// empty output. Only after a successful spawn checks the helper in the
+/// reported directory and in the effective override directory.
+// Local `--exec-path` probe only (no repo, no network): bypasses
+// `GitBinary::build_command` security flags intentionally; needs a
+// blocking spawn in this sync selector.
+#[allow(clippy::disallowed_methods)]
+pub fn has_remote_https_helper_with_env<S: std::hash::BuildHasher>(
+    path: &Path,
+    env: Option<&HashMap<String, String, S>>,
+) -> bool {
+    // Effective override: explicit env wins, else process env.
+    let from_map = env.and_then(|map| map.get("GIT_EXEC_PATH")).cloned();
+    let effective_override: Option<String> = match from_map {
+        Some(value) => Some(value),
+        None => std::env::var("GIT_EXEC_PATH").ok(),
+    };
     // Spawn FIRST: the binary must exist and run. A `GIT_EXEC_PATH`
     // override must never validate a binary that fails to spawn (otherwise
     // `/invalid/git` plus a valid override directory would wrongly return
     // true and bypass the fallback).
-    let output = std::process::Command::new(path).arg("--exec-path").output();
+    let mut command = std::process::Command::new(path);
+    command.arg("--exec-path");
+    if let Some(value) = env.and_then(|map| map.get("GIT_EXEC_PATH")) {
+        command.env("GIT_EXEC_PATH", value);
+    }
+    let output = command.output();
     let output = match output {
         Ok(output) => output,
         Err(_) => return false,
@@ -78,7 +110,7 @@ pub fn has_remote_https_helper(path: &Path) -> bool {
     // Git already reflects `GIT_EXEC_PATH` in its `--exec-path` output, so
     // the check above covers the common case. Also accept the override
     // directory itself — but ONLY after the spawn above succeeded.
-    if let Ok(exec_path_override) = std::env::var("GIT_EXEC_PATH") {
+    if let Some(exec_path_override) = effective_override {
         let trimmed = exec_path_override.trim().to_string();
         if !trimmed.is_empty() && helper_exists_in_dir(Path::new(&trimmed)) {
             return true;
@@ -220,6 +252,7 @@ pub fn select_basic_git_binary_with_info(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(unix)]
     use std::io::Write as _;
 
     /// Serializes tests that observe or mutate the process-wide
@@ -231,6 +264,7 @@ mod tests {
     /// `exec_dir` (optionally containing a `git-remote-https` helper) and
     /// answers `--version` successfully, so every fake counts as
     /// Basic-usable while only `with_helper` fakes count as Https-usable.
+    #[cfg(unix)]
     fn fake_git(dir: &tempfile::TempDir, name: &str, with_helper: bool) -> PathBuf {
         let exec_dir = dir.path().join(format!("{name}-exec"));
         std::fs::create_dir_all(&exec_dir).unwrap();
@@ -262,6 +296,7 @@ mod tests {
         git_path
     }
 
+    #[cfg(unix)]
     #[test]
     fn test_select_prefers_system_when_valid() {
         let _env_guard = ENV_LOCK.lock().unwrap();
@@ -274,6 +309,7 @@ mod tests {
         assert_eq!(selected.reason, "validated");
     }
 
+    #[cfg(unix)]
     #[test]
     fn test_select_falls_back_to_bundled_when_system_lacks_helper() {
         let _env_guard = ENV_LOCK.lock().unwrap();
@@ -286,6 +322,7 @@ mod tests {
         assert_eq!(selected.reason, "fallback-missing-helper");
     }
 
+    #[cfg(unix)]
     #[test]
     fn test_select_falls_back_to_bundled_when_system_missing() {
         let _env_guard = ENV_LOCK.lock().unwrap();
@@ -297,6 +334,7 @@ mod tests {
         assert_eq!(selected.source, "bundled");
     }
 
+    #[cfg(unix)]
     #[test]
     fn test_select_bails_when_neither_usable() {
         let _env_guard = ENV_LOCK.lock().unwrap();
@@ -318,6 +356,7 @@ mod tests {
         assert!(message.contains("tried system=None"), "{message}");
     }
 
+    #[cfg(unix)]
     #[test]
     #[allow(clippy::disallowed_methods)]
     fn test_select_does_not_fall_back_on_remote_command_failure() {
@@ -395,6 +434,7 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
     #[test]
     fn test_basic_selector_picks_helperless_git_https_selector_skips_it() {
         let _env_guard = ENV_LOCK.lock().unwrap();
@@ -431,6 +471,7 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
     #[test]
     fn test_basic_selector_falls_back_to_bundled_when_system_missing() {
         let _env_guard = ENV_LOCK.lock().unwrap();
@@ -451,5 +492,99 @@ mod tests {
         let message = err.to_string();
         assert!(message.contains("no usable git binary"), "{message}");
         assert!(message.contains("tried system=None"), "{message}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_has_remote_https_helper_with_env_honors_passed_override() {
+        // Passed `GIT_EXEC_PATH` is honored even when the process env lacks it.
+        let _env_guard = ENV_LOCK.lock().unwrap();
+        let previous = std::env::var("GIT_EXEC_PATH").ok();
+        unsafe {
+            std::env::remove_var("GIT_EXEC_PATH");
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let exec_override = dir.path().join("override-exec");
+        std::fs::create_dir_all(&exec_override).unwrap();
+        let helper = exec_override.join("git-remote-https");
+        std::fs::write(&helper, "#!/bin/sh\nexit 0\n").unwrap();
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            let mut permissions = std::fs::metadata(&helper).unwrap().permissions();
+            permissions.set_mode(0o755);
+            std::fs::set_permissions(&helper, permissions).unwrap();
+        }
+        assert!(helper_exists_in_dir(&exec_override));
+        let system = fake_git(&dir, "system-git", false);
+        // Sanity: helperless stub is rejected without any override.
+        assert!(!has_remote_https_helper(&system));
+        assert!(!has_remote_https_helper_with_env(&system, None::<&HashMap<String, String>>));
+        let mut env = HashMap::new();
+        env.insert(
+            "GIT_EXEC_PATH".to_string(),
+            exec_override.to_string_lossy().to_string(),
+        );
+        let with_override = has_remote_https_helper_with_env(&system, Some(&env));
+        // Spawn-first: a missing binary stays false even with a valid override.
+        let missing_with_override =
+            has_remote_https_helper_with_env(Path::new("/invalid/git"), Some(&env));
+        match previous {
+            Some(value) => unsafe {
+                std::env::set_var("GIT_EXEC_PATH", value);
+            },
+            None => unsafe {
+                std::env::remove_var("GIT_EXEC_PATH");
+            },
+        }
+        assert!(
+            with_override,
+            "passed `GIT_EXEC_PATH` helper dir must validate a spawnable binary"
+        );
+        assert!(
+            !missing_with_override,
+            "missing binary with a valid passed `GIT_EXEC_PATH` must be false"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_has_remote_https_helper_honors_process_override() {
+        // Process-only `GIT_EXEC_PATH` still validates via the wrapper.
+        let _env_guard = ENV_LOCK.lock().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let exec_override = dir.path().join("override-exec");
+        std::fs::create_dir_all(&exec_override).unwrap();
+        let helper = exec_override.join("git-remote-https");
+        std::fs::write(&helper, "#!/bin/sh\nexit 0\n").unwrap();
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            let mut permissions = std::fs::metadata(&helper).unwrap().permissions();
+            permissions.set_mode(0o755);
+            std::fs::set_permissions(&helper, permissions).unwrap();
+        }
+        assert!(helper_exists_in_dir(&exec_override));
+        let system = fake_git(&dir, "system-git", false);
+        let previous = std::env::var("GIT_EXEC_PATH").ok();
+        unsafe {
+            std::env::set_var("GIT_EXEC_PATH", &exec_override);
+        }
+        let via_wrapper = has_remote_https_helper(&system);
+        let via_none = has_remote_https_helper_with_env(&system, None::<&HashMap<String, String>>);
+        match previous {
+            Some(value) => unsafe {
+                std::env::set_var("GIT_EXEC_PATH", value);
+            },
+            None => unsafe {
+                std::env::remove_var("GIT_EXEC_PATH");
+            },
+        }
+        assert!(
+            via_wrapper,
+            "process `GIT_EXEC_PATH` helper dir must validate a spawnable binary"
+        );
+        assert!(
+            via_none,
+            "`None` env must fall back to the process `GIT_EXEC_PATH`"
+        );
     }
 }
