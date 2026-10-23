@@ -1552,39 +1552,146 @@ impl RealGitRepository {
             command). Install a git with HTTPS support or bundle one."
         );
     }
-    /// Effective URL of `remote_name` via the Basic binary
+    /// Probe `GitBinary` sharing the remote command's `env`, so `GIT_CONFIG_*`
+    /// `insteadOf`/`pushInsteadOf` rewrites classify identically to execution.
+    fn probe_git_with_env(&self, env: &HashMap<String, String>) -> GitBinary {
+        GitBinary::new(
+            self.any_git_binary_path.clone(),
+            self.command_directory(),
+            self.path(),
+            self.executor.clone(),
+            self.is_trusted(),
+        )
+        .envs(env.clone())
+    }
+    /// Effective URL of `remote_name` via the Basic binary with `env`
     /// (`git remote get-url [--push] <name>`), which honors `pushurl` and
-    /// `url.insteadOf`. `None` when the remote is unresolvable (missing remote
-    /// or non-zero exit) — callers treat that as HTTPS (strict).
-    async fn effective_remote_url(&self, remote_name: &str, for_push: bool) -> Option<String> {
-        let git = self.git_binary();
+    /// `url.insteadOf` under `env`. `None` when the remote is unresolvable
+    /// (missing remote or non-zero exit) — callers treat that as HTTPS (strict).
+    async fn effective_remote_url(
+        &self,
+        remote_name: &str,
+        for_push: bool,
+        env: &HashMap<String, String>,
+    ) -> Option<String> {
+        let git = self.probe_git_with_env(env);
         let output = if for_push {
             git.run(&["remote", "get-url", "--push", remote_name]).await
         } else {
             git.run(&["remote", "get-url", remote_name]).await
         }
         .ok()?;
-        let url = output.trim().to_string();
-        if url.is_empty() { None } else { Some(url) }
+        let url = output.lines().map(str::trim).find(|line| !line.is_empty())?;
+        Some(url.to_string())
+    }
+    /// ALL effective URLs of `remote_name` via the Basic binary with `env`
+    /// (`git remote get-url [--push] --all <name>`), honoring `pushurl` and
+    /// `url.insteadOf`. `push` sends to every `pushurl`, so callers must
+    /// classify EACH URL and require HTTPS if ANY needs it. `None` on
+    /// unresolvable remote (strict HTTPS). Falls back to the single-URL probe
+    /// when `--all` is unsupported (older git), so the single probe stays in
+    /// the production path.
+    async fn effective_remote_urls(
+        &self,
+        remote_name: &str,
+        for_push: bool,
+        env: &HashMap<String, String>,
+    ) -> Option<Vec<String>> {
+        let git = self.probe_git_with_env(env);
+        let output = if for_push {
+            git.run(&["remote", "get-url", "--push", "--all", remote_name])
+                .await
+        } else {
+            git.run(&["remote", "get-url", "--all", remote_name]).await
+        }
+        .ok()?;
+        let urls: Vec<String> = output
+            .lines()
+            .map(str::trim)
+            .filter(|line| !line.is_empty())
+            .map(ToString::to_string)
+            .collect();
+        if !urls.is_empty() {
+            return Some(urls);
+        }
+        self.effective_remote_url(remote_name, for_push, env)
+            .await
+            .map(|url| vec![url])
+    }
+    /// Remote names (`git remote`) under `env`. `None` on spawn/parse failure;
+    /// callers treat that as HTTPS (strict).
+    async fn remote_names_with_env(&self, env: &HashMap<String, String>) -> Option<Vec<String>> {
+        let git = self.probe_git_with_env(env);
+        let output = git.run(&["remote"]).await.ok()?;
+        let names: Vec<String> = output
+            .lines()
+            .map(str::trim)
+            .filter(|line| !line.is_empty())
+            .map(ToString::to_string)
+            .collect();
+        Some(names)
+    }
+    /// Whether `remote_name` needs HTTPS: unresolvable or ANY effective URL
+    /// classifying HTTPS (strict).
+    async fn remote_requires_https(
+        &self,
+        remote_name: &str,
+        for_push: bool,
+        env: &HashMap<String, String>,
+    ) -> bool {
+        match self.effective_remote_urls(remote_name, for_push, env).await {
+            None => true,
+            Some(urls) => urls
+                .iter()
+                .any(|url| classify_remote_url(url) == RemoteCapability::Https),
+        }
+    }
+    /// Whether `fetch --all` needs HTTPS: true if ANY fetched remote needs it.
+    /// SSH-only repos stay Basic; empty/unlistable remotes stay HTTPS (strict).
+    async fn fetch_all_requires_https(&self, env: &HashMap<String, String>) -> bool {
+        let Some(names) = self.remote_names_with_env(env).await else {
+            return true;
+        };
+        if names.is_empty() {
+            return true;
+        }
+        for name in &names {
+            if self.remote_requires_https(name, false, env).await {
+                return true;
+            }
+        }
+        false
+    }
+    /// Whether `fetch --unshallow` (no remote arg, so git uses `origin`)
+    /// needs HTTPS. Falls back to the single remote when `origin` is absent;
+    /// otherwise HTTPS (strict).
+    async fn unshallow_requires_https(&self, env: &HashMap<String, String>) -> bool {
+        if let Some(urls) = self.effective_remote_urls("origin", false, env).await {
+            return urls
+                .iter()
+                .any(|url| classify_remote_url(url) == RemoteCapability::Https);
+        }
+        if let Some(names) = self.remote_names_with_env(env).await {
+            if names.len() == 1 {
+                return self.remote_requires_https(&names[0], false, env).await;
+            }
+        }
+        true
     }
     /// Binary for a remote op against `remote_name`, chosen by the remote's
     /// capability: SSH/local remotes run on the Basic binary
     /// (`any_git_binary_path`, which spawns without the helper); `https://`
     /// /`http://` — and unresolvable/unknown URLs (strict) — run on the HTTPS
-    /// binary re-selected with `env`. Single attempt: a non-zero remote exit
-    /// (auth/network) surfaces without switching binaries.
+    /// binary re-selected with `env`. ANY effective URL (`--push --all` for
+    /// push, `--all` for fetch) needing HTTPS forces HTTPS. Single attempt: a
+    /// non-zero remote exit (auth/network) surfaces without switching binaries.
     async fn remote_binary_for(
         &self,
         remote_name: &str,
         for_push: bool,
         env: &HashMap<String, String>,
     ) -> Result<(PathBuf, String)> {
-        let capability = self
-            .effective_remote_url(remote_name, for_push)
-            .await
-            .map(|url| classify_remote_url(&url))
-            .unwrap_or(RemoteCapability::Https);
-        if capability == RemoteCapability::Basic {
+        if !self.remote_requires_https(remote_name, for_push, env).await {
             return Ok((self.any_git_binary_path.clone(), self.tried_binaries()));
         }
         self.https_binary_with_env(Some(env))
@@ -3264,24 +3371,37 @@ impl GitRepository for RealGitRepository {
         let working_directory = self.command_directory();
         let git_directory = self.path();
         let remote_name = format!("{}", fetch_options);
-        // `FetchOptions::Remote` names the remote to route by; `--all` /
-        // `--unshallow` name no single remote, so they stay on the HTTPS
-        // binary (strict, like unresolvable URLs).
-        let routing_remote = match &fetch_options {
-            FetchOptions::Remote(remote) => Some(remote.name.to_string()),
-            FetchOptions::All | FetchOptions::Unshallow => None,
-        };
+        // `FetchOptions::Remote` routes by that remote's effective fetch URLs
+        // (`get-url --all` honors insteadOf). `--all` enumerates every remote
+        // and needs HTTPS only if >=1 effective URL needs it (SSH-only stays
+        // Basic). `--unshallow` (no remote arg, so git uses `origin`) resolves
+        // that default remote instead of forcing HTTPS. Unresolvable stays
+        // HTTPS (strict). Single attempt, never fallback on remote exit.
+        let fetch_kind = fetch_options;
         let executor = cx.background_executor().clone();
         let is_trusted = self.is_trusted();
         // Note: Do not spawn this command on the background thread, it might pop open the credential helper
         // which we want to block on.
         async move {
             let env_map: &HashMap<String, String> = &env;
-            let (git_binary_path, tried_binaries) = match &routing_remote {
-                Some(remote_name) => {
-                    self.remote_binary_for(remote_name, false, env_map).await?
+            let (git_binary_path, tried_binaries) = match &fetch_kind {
+                FetchOptions::Remote(remote) => {
+                    self.remote_binary_for(&remote.name, false, env_map).await?
                 }
-                None => self.https_binary_with_env(Some(env_map))?,
+                FetchOptions::All => {
+                    if self.fetch_all_requires_https(env_map).await {
+                        self.https_binary_with_env(Some(env_map))?
+                    } else {
+                        (self.any_git_binary_path.clone(), self.tried_binaries())
+                    }
+                }
+                FetchOptions::Unshallow => {
+                    if self.unshallow_requires_https(env_map).await {
+                        self.https_binary_with_env(Some(env_map))?
+                    } else {
+                        (self.any_git_binary_path.clone(), self.tried_binaries())
+                    }
+                }
             };
             let git = GitBinary::new(
                 git_binary_path.clone(),
@@ -7872,6 +7992,193 @@ mod tests {
             !bundled_invoked.exists(),
             "SSH fetch must not demand the HTTPS helper binary"
         );
+    }
+    /// `fetch --all` on an SSH-only repo must stay on the Basic binary:
+    /// enumerate remotes and require HTTPS only if >=1 effective fetch URL
+    /// needs it. Regression: `--all` previously forced HTTPS even when every
+    /// remote is SSH.
+    #[cfg(unix)]
+    #[gpui::test]
+    async fn test_fetch_all_ssh_only_uses_basic_git(cx: &mut TestAppContext) {
+        cx.executor().allow_parking();
+        let temp = tempfile::tempdir().unwrap();
+        let system_invoked = temp.path().join("system_fetch_all_invoked");
+        let system = write_stub_git(
+            temp.path(),
+            "system-git",
+            false,
+            &format!(
+                "for a in \"$@\"; do if [ \"$a\" = \"get-url\" ]; then echo \"git@github.com:example/project.git\"; exit 0; fi; done\nfor a in \"$@\"; do if [ \"$a\" = \"remote\" ]; then echo \"origin\"; exit 0; fi; done\ntouch \"{}\"; exit 0",
+                system_invoked.display()
+            ),
+        );
+        let bundled_invoked = temp.path().join("bundled_fetch_all_invoked");
+        let bundled = write_stub_git(
+            temp.path(),
+            "bundled-git",
+            true,
+            &format!("touch \"{}\"; exit 0", bundled_invoked.display()),
+        );
+        let dotgit = empty_dot_git(&temp.path().join("repo"));
+        let repo = RealGitRepository::new_with_secondary(
+            &dotgit,
+            Some(bundled),
+            Some(system.clone()),
+            None,
+            cx.executor(),
+        )
+        .unwrap();
+        assert_eq!(repo.any_git_binary_path, system);
+        repo.fetch(
+            FetchOptions::All,
+            AskPassDelegate::new(&mut cx.to_async(), |_, _, _| {}),
+            Arc::new(test_commit_envs()),
+            cx.to_async(),
+        )
+        .await
+        .unwrap();
+        assert!(
+            system_invoked.exists(),
+            "fetch --all on SSH-only repo must run on the Basic system git"
+        );
+        assert!(
+            !bundled_invoked.exists(),
+            "fetch --all on SSH-only repo must not demand the HTTPS helper binary"
+        );
+    }
+
+    /// Push with several `pushurl`s must inspect ALL of them (`--push --all`)
+    /// and require HTTPS if ANY needs it. Regression: only the first URL was
+    /// checked, so an SSH-first + HTTPS-second config wrongly stayed Basic.
+    #[cfg(unix)]
+    #[gpui::test]
+    async fn test_push_multiple_urls_requires_https(cx: &mut TestAppContext) {
+        cx.executor().allow_parking();
+        let temp = tempfile::tempdir().unwrap();
+        let system_invoked = temp.path().join("system_push_invoked");
+        let system = write_stub_git(
+            temp.path(),
+            "system-git",
+            false,
+            &format!(
+                "has_geturl=0; has_push=0; has_all=0; for a in \"$@\"; do if [ \"$a\" = \"get-url\" ]; then has_geturl=1; fi; if [ \"$a\" = \"--push\" ]; then has_push=1; fi; if [ \"$a\" = \"--all\" ]; then has_all=1; fi; done; if [ \"$has_geturl\" = 1 ]; then if [ \"$has_push\" = 1 ] && [ \"$has_all\" = 1 ]; then echo \"git@github.com:example/project.git\"; echo \"https://github.com/example/project.git\"; else echo \"git@github.com:example/project.git\"; fi; exit 0; fi\ntouch \"{}\"; exit 0",
+                system_invoked.display()
+            ),
+        );
+        let bundled_invoked = temp.path().join("bundled_push_invoked");
+        let bundled = write_stub_git(
+            temp.path(),
+            "bundled-git",
+            true,
+            &format!("touch \"{}\"; exit 0", bundled_invoked.display()),
+        );
+        let dotgit = empty_dot_git(&temp.path().join("repo"));
+        let repo = RealGitRepository::new_with_secondary(
+            &dotgit,
+            Some(bundled.clone()),
+            Some(system.clone()),
+            None,
+            cx.executor(),
+        )
+        .unwrap();
+        repo.push(
+            "main".to_string(),
+            "main".to_string(),
+            "origin".to_string(),
+            None,
+            AskPassDelegate::new(&mut cx.to_async(), |_, _, _| {}),
+            Arc::new(test_commit_envs()),
+            cx.to_async(),
+        )
+        .await
+        .unwrap();
+        assert!(
+            bundled_invoked.exists(),
+            "push with an HTTPS URL among pushurls must run on the HTTPS binary"
+        );
+        assert!(
+            !system_invoked.exists(),
+            "push with an HTTPS pushurl must not run on the Basic-only system git"
+        );
+    }
+
+    /// The `get-url` probe must run with the push/pull/fetch command env so
+    /// `GIT_CONFIG_*` `insteadOf` rewrites classify identically to the real
+    /// remote op. The same stub answers SSH without the env and HTTPS with it;
+    /// both the classified URL and the selected binary must flip with the env.
+    #[cfg(unix)]
+    #[gpui::test]
+    async fn test_remote_url_respects_command_env(cx: &mut TestAppContext) {
+        cx.executor().allow_parking();
+        let temp = tempfile::tempdir().unwrap();
+        let system = write_stub_git(
+            temp.path(),
+            "system-git",
+            false,
+            "for a in \"$@\"; do if [ \"$a\" = \"get-url\" ]; then if [ -n \"$GIT_CONFIG_COUNT\" ]; then echo \"https://github.com/example/project.git\"; else echo \"git@github.com:example/project.git\"; fi; exit 0; fi; done\nfor a in \"$@\"; do if [ \"$a\" = \"remote\" ]; then echo \"origin\"; exit 0; fi; done\ntouch \"/tmp/should-not-run-basic-fetch\"; exit 0",
+        );
+        let bundled_invoked = temp.path().join("bundled_env_fetch_invoked");
+        let bundled = write_stub_git(
+            temp.path(),
+            "bundled-git",
+            true,
+            &format!("touch \"{}\"; exit 0", bundled_invoked.display()),
+        );
+        let dotgit = empty_dot_git(&temp.path().join("repo"));
+        let repo = RealGitRepository::new_with_secondary(
+            &dotgit,
+            Some(bundled.clone()),
+            Some(system.clone()),
+            None,
+            cx.executor(),
+        )
+        .unwrap();
+        let mut https_env = test_commit_envs();
+        https_env.insert("GIT_CONFIG_COUNT".to_string(), "1".to_string());
+        https_env.insert(
+            "GIT_CONFIG_KEY_0".to_string(),
+            "url.https://github.com/.insteadOf".to_string(),
+        );
+        https_env.insert("GIT_CONFIG_VALUE_0".to_string(), "git@github.com:".to_string());
+        let plain_env = test_commit_envs();
+        let plain_single = repo
+            .effective_remote_url("origin", false, &plain_env)
+            .await
+            .expect("plain probe must resolve");
+        assert_eq!(
+            classify_remote_url(&plain_single),
+            RemoteCapability::Basic,
+            "plain env must classify Basic, got {plain_single:?}"
+        );
+        let plain_urls = repo
+            .effective_remote_urls("origin", false, &plain_env)
+            .await
+            .expect("plain probe must resolve");
+        assert!(
+            plain_urls.iter().all(|u| classify_remote_url(u) == RemoteCapability::Basic),
+            "plain env must classify Basic, got {plain_urls:?}"
+        );
+        let https_single = repo
+            .effective_remote_url("origin", false, &https_env)
+            .await
+            .expect("command-env probe must resolve");
+        assert_eq!(
+            classify_remote_url(&https_single),
+            RemoteCapability::Https,
+            "command env insteadOf must reclassify to HTTPS, got {https_single:?}"
+        );
+        let https_urls = repo
+            .effective_remote_urls("origin", false, &https_env)
+            .await
+            .expect("command-env probe must resolve");
+        assert!(
+            https_urls.iter().any(|u| classify_remote_url(u) == RemoteCapability::Https),
+            "command env insteadOf must reclassify to HTTPS, got {https_urls:?}"
+        );
+        let (plain_path, _) = repo.remote_binary_for("origin", false, &plain_env).await.unwrap();
+        assert_eq!(plain_path, system);
+        let (https_path, _) = repo.remote_binary_for("origin", false, &https_env).await.unwrap();
+        assert_eq!(https_path, bundled);
     }
 
     /// The process-`PATH` candidate is not dropped when the login-shell git

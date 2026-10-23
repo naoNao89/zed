@@ -618,28 +618,6 @@ impl RealFs {
         }
     }
 
-    /// Validated HTTPS selection via `select_git_binary_with_info`:
-    /// system if it spawns and ships `git-remote-https` → bundled if so →
-    /// bail. Required for remote HTTPS ops (`https://`/`http://` clones,
-    /// `fetch`/`pull`/`push`). Fallback only on
-    /// missing/spawn/helper-missing; never on auth/network/non-zero exit.
-    fn resolve_https_git_binary(&self) -> Result<(PathBuf, &'static str)> {
-        let system = which::which("git").ok();
-        let bundled = self.bundled_git_binary_path.clone();
-        match select_git_binary_with_info(system, bundled) {
-            Ok(selected) => {
-                log::info!(
-                    "selected git binary {:?} source={} reason={}",
-                    selected.path,
-                    selected.source,
-                    selected.reason
-                );
-                Ok((selected.path, selected.source))
-            }
-            Err(e) => Err(e),
-        }
-    }
-
     fn fallback_basic_git_binary(&self, primary_source: &str) -> Option<(PathBuf, &'static str)> {
         // Primary was already validated; only a spawn race can land here.
         // Retry only with the other candidate when it spawns.
@@ -676,6 +654,93 @@ impl RealFs {
     fn clone_url_needs_https_helper(repo_url: &str) -> bool {
         let lower = repo_url.trim_start().to_ascii_lowercase();
         lower.starts_with("https://") || lower.starts_with("http://")
+    }
+
+    /// Whether this clone needs the HTTPS helper after `url.*.insteadOf`
+    /// rewrites. The REWRITTEN url decides (`https://`/`http://` → HTTPS,
+    /// else Basic — same table as `clone_url_needs_https_helper`); when the
+    /// probe produced no rewrite (`None`), the raw input decides (strict:
+    /// raw `https://`/`http://` → HTTPS).
+    fn effective_clone_needs_https(raw_url: &str, rewritten: Option<&str>) -> bool {
+        Self::clone_url_needs_https_helper(rewritten.unwrap_or(raw_url))
+    }
+
+    /// Probe `url.*.insteadOf` rewrites for a clone URL with
+    /// `git ls-remote --get-url <url>`, run on the Basic candidate binary.
+    /// Documented as no-network: it only expands the URL from config and
+    /// exits without contacting the remote. Uses the same process environment
+    /// the clone spawn will run with, so both observe the same `GIT_CONFIG_*`
+    /// overrides. `None` on any failure (spawn error, non-zero exit, empty or
+    /// non-UTF-8 output) — callers fall back to the raw input URL.
+    async fn probe_rewritten_clone_url(
+        basic_git: &Path,
+        work_dir: &Path,
+        repo_url: &str,
+    ) -> Option<String> {
+        let output = new_command(basic_git)
+            .current_dir(work_dir)
+            .args(["ls-remote", "--get-url", repo_url])
+            .output()
+            .await
+            .ok()?;
+        if !output.status.success() {
+            return None;
+        }
+        let rewritten = String::from_utf8(output.stdout).ok()?;
+        let trimmed = rewritten.trim();
+        if trimmed.is_empty() {
+            None
+        } else {
+            Some(trimmed.to_string())
+        }
+    }
+
+    /// Select the clone binary with `insteadOf` resolution. Resolves the Basic
+    /// candidate first (binary must spawn — it also serves as the probe
+    /// binary), classifies the REWRITTEN url, then resolves the HTTPS
+    /// candidate only when the rewrite (or raw fallback) needs it. Returns
+    /// the binary, its `source`, and whether HTTPS was selected (so the
+    /// caller retries spawn failures with the matching fallback only;
+    /// non-zero remote exits surface without switching binaries).
+    async fn select_clone_binary(
+        system: Option<PathBuf>,
+        bundled: Option<PathBuf>,
+        repo_url: &str,
+        work_dir: &Path,
+    ) -> Result<(PathBuf, &'static str, bool)> {
+        let basic = select_basic_git_binary_with_info(system.clone(), bundled.clone())?;
+        let rewritten = Self::probe_rewritten_clone_url(&basic.path, work_dir, repo_url).await;
+        if Self::effective_clone_needs_https(repo_url, rewritten.as_deref()) {
+            let https = select_git_binary_with_info(system, bundled)?;
+            log::info!(
+                "selected git binary {:?} source={} reason={}",
+                https.path,
+                https.source,
+                https.reason
+            );
+            Ok((https.path, https.source, true))
+        } else {
+            log::info!(
+                "selected git binary {:?} source={} reason={}",
+                basic.path,
+                basic.source,
+                basic.reason
+            );
+            Ok((basic.path, basic.source, false))
+        }
+    }
+
+    /// Clone selection with the process-`PATH` system git plus the bundled
+    /// auxiliary binary. Single `source=`/`reason=` log line from
+    /// [`Self::select_clone_binary`]; fallback stays spawn-failure-only.
+    async fn resolve_clone_git_binary(
+        &self,
+        repo_url: &str,
+        work_dir: &Path,
+    ) -> Result<(PathBuf, &'static str, bool)> {
+        let system = which::which("git").ok();
+        let bundled = self.bundled_git_binary_path.clone();
+        Self::select_clone_binary(system, bundled, repo_url, work_dir).await
     }
 
     #[cfg(target_os = "windows")]
@@ -1431,15 +1496,14 @@ impl Fs for RealFs {
         };
 
         let job_tracker = JobTracker::new(job_info, self.job_event_subscribers.clone());
-        // HTTPS URLs require the helper; local paths, `ssh://`, `git@`, etc.
-        // work with a Basic-only binary. Spawn-failure retries with the other
+        // The REWRITTEN url decides: `url.*.insteadOf` can turn a local-style
+        // input (e.g. `gh:org/repo.git`) into `https://…`, which requires the
+        // helper; anything else (local paths, `ssh://`, `git@`, etc.) works
+        // with a Basic-only binary. Spawn-failure retries with the other
         // candidate only; non-zero exit (auth) never falls back.
-        let needs_https = Self::clone_url_needs_https_helper(repo_url);
-        let (git_binary, source) = if needs_https {
-            self.resolve_https_git_binary()?
-        } else {
-            self.resolve_git_binary()?
-        };
+        let (git_binary, source, needs_https) = self
+            .resolve_clone_git_binary(repo_url, abs_work_directory)
+            .await?;
         // Fallback only on spawn failure; a non-zero exit (e.g. auth failure)
         // must surface without switching binaries.
         let mut child = match new_command(&git_binary)
@@ -3926,5 +3990,121 @@ fn atomic_replace<P: AsRef<Path>>(
             None,
             None,
         )
+    }
+}
+
+#[cfg(test)]
+mod clone_tests {
+    use super::*;
+
+    /// Writes a stub `git` for clone-selection tests. The stub answers
+    /// `--exec-path` with a directory that either contains an executable
+    /// `git-remote-https` (healthy) or not (Basic-only), answers `--version`
+    /// successfully, and answers `ls-remote --get-url <url>` by echoing the
+    /// input URL — except `gh:`-style inputs, which echo an `https://` URL
+    /// like a `url.insteadOf` rewrite would.
+    #[cfg(unix)]
+    fn write_clone_stub_git(dir: &Path, name: &str, with_helper: bool) -> PathBuf {
+        use std::os::unix::fs::PermissionsExt as _;
+        let exec_dir = dir.join(format!("{name}-exec"));
+        std::fs::create_dir_all(&exec_dir).unwrap();
+        if with_helper {
+            let helper = exec_dir.join("git-remote-https");
+            std::fs::write(&helper, "#!/bin/sh\nexit 0\n").unwrap();
+            std::fs::set_permissions(&helper, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let git_path = dir.join(name);
+        let script = format!(
+            "#!/bin/sh\nif [ \"$1\" = \"--exec-path\" ]; then echo \"{}\"; exit 0; fi\nif [ \"$1\" = \"--version\" ]; then echo \"git version stub\"; exit 0; fi\nif [ \"$1\" = \"ls-remote\" ]; then case \"$3\" in gh:*) echo \"https://github.com/org/repo.git\";; *) echo \"$3\";; esac; exit 0; fi\nexit 0\n",
+            exec_dir.display()
+        );
+        std::fs::write(&git_path, &script).unwrap();
+        std::fs::set_permissions(&git_path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        git_path
+    }
+
+    /// `url.*.insteadOf` rewrites can turn a local-style clone URL into HTTPS:
+    /// the probe (`ls-remote --get-url`, documented no-network) runs on the
+    /// Basic candidate and the REWRITTEN url decides Basic vs HTTPS.
+    #[cfg(unix)]
+    #[test]
+    fn test_clone_rewritten_to_https() {
+        let temp = tempfile::tempdir().unwrap();
+        let basic = write_clone_stub_git(temp.path(), "basic-git", false);
+        let https = write_clone_stub_git(temp.path(), "https-git", true);
+        let work_dir = temp.path();
+
+        // insteadOf-style rewrite: local-style input resolves to https → HTTPS binary.
+        let (path, _source, needs_https) = smol::block_on(RealFs::select_clone_binary(
+            Some(basic.clone()),
+            Some(https.clone()),
+            "gh:org/repo.git",
+            work_dir,
+        ))
+        .unwrap();
+        assert!(
+            needs_https,
+            "rewritten https URL must need the HTTPS helper"
+        );
+        assert_eq!(path, https);
+
+        // Raw https still needs HTTPS ...
+        let (path, _source, needs_https) = smol::block_on(RealFs::select_clone_binary(
+            Some(basic.clone()),
+            Some(https.clone()),
+            "https://github.com/org/repo.git",
+            work_dir,
+        ))
+        .unwrap();
+        assert!(needs_https, "raw https URL must need the HTTPS helper");
+        assert_eq!(path, https);
+
+        // ... while raw ssh/local stay Basic (probe echoes the input → not https).
+        for raw in ["git@github.com:org/repo.git", "/srv/git/repo.git"] {
+            let (path, _source, needs_https) = smol::block_on(RealFs::select_clone_binary(
+                Some(basic.clone()),
+                Some(https.clone()),
+                raw,
+                work_dir,
+            ))
+            .unwrap();
+            assert!(
+                !needs_https,
+                "raw {raw:?} must work with a Basic-only binary"
+            );
+            assert_eq!(path, basic);
+        }
+    }
+
+    /// Pure URL table, no stubs or shells: `https://`/`http://` need the
+    /// helper, everything else works Basic-only, and a probe rewrite wins
+    /// over the raw input. Ungated — runs on every platform.
+    #[test]
+    fn test_effective_clone_needs_https() {
+        assert!(RealFs::effective_clone_needs_https(
+            "https://example.com/r.git",
+            None
+        ));
+        assert!(RealFs::effective_clone_needs_https(
+            "http://example.com/r.git",
+            None
+        ));
+        assert!(!RealFs::effective_clone_needs_https(
+            "git@github.com:o/r.git",
+            None
+        ));
+        assert!(!RealFs::effective_clone_needs_https("/srv/git/r.git", None));
+        assert!(!RealFs::effective_clone_needs_https(
+            "gh:org/repo.git",
+            None
+        ));
+        assert!(RealFs::effective_clone_needs_https(
+            "gh:org/repo.git",
+            Some("https://github.com/org/repo.git")
+        ));
+        assert!(!RealFs::effective_clone_needs_https(
+            "gh:org/repo.git",
+            Some("git@github.com:org/repo.git")
+        ));
     }
 }
