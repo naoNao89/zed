@@ -1591,54 +1591,34 @@ impl RealGitRepository {
     /// unresolvable remote, on `--all` failure (unsupported flag / spawn
     /// failure — the full list is undeterminable, UNKNOWN strict, never
     /// silently Basic), or on successful-but-empty output (strict).
-    /// Fetch callers must NOT use this: `fetch`/`pull` classify ONLY the first
-    /// fetch URL git will use (see `effective_remote_url`).
+    /// Fetch/pull callers must NOT use this: `fetch`/`pull` classify ONLY the
+    /// first fetch URL git will use (see `effective_remote_url`).
     async fn effective_remote_urls(
         &self,
         remote_name: &str,
-        for_push: bool,
         env: &HashMap<String, String>,
     ) -> Option<Vec<String>> {
-        // Fetch callers use the singular probe (`effective_remote_url`); this
-        // helper only serves push (`--push --all`). `for_push=false` is kept
-        // for the old-git fallback contract below (singular on `Err`).
         let git = self.probe_git_with_env(env);
-        let result = if for_push {
-            git.run(&["remote", "get-url", "--push", "--all", remote_name])
-                .await
+        let output = git
+            .run(&["remote", "get-url", "--push", "--all", remote_name])
+            .await
+            .ok()?;
+        // `Err` (unsupported `--all` / spawn failure) already maps to `None`
+        // above: the full push-URL list is undeterminable (a second HTTPS
+        // `pushurl` could hide behind the failure) → UNKNOWN strict, never
+        // silently Basic.
+        let urls: Vec<String> = output
+            .lines()
+            .map(str::trim)
+            .filter(|line| !line.is_empty())
+            .map(ToString::to_string)
+            .collect();
+        if urls.is_empty() {
+            // Successful-but-empty: undeterminable, HTTPS strict — never
+            // fall back to singular (that would risk silently Basic).
+            None
         } else {
-            git.run(&["remote", "get-url", "--all", remote_name]).await
-        };
-        match result {
-            Ok(output) => {
-                let urls: Vec<String> = output
-                    .lines()
-                    .map(str::trim)
-                    .filter(|line| !line.is_empty())
-                    .map(ToString::to_string)
-                    .collect();
-                if urls.is_empty() {
-                    // Successful-but-empty: undeterminable, HTTPS strict — never
-                    // fall back to singular (that would risk silently Basic).
-                    None
-                } else {
-                    Some(urls)
-                }
-            }
-            Err(_) => {
-                if for_push {
-                    // Unsupported `--all` / spawn failure: the full push-URL
-                    // list is undeterminable (a second HTTPS `pushurl` could
-                    // hide behind the failure) → UNKNOWN strict.
-                    None
-                } else {
-                    // Old git without `--all`: fall back to the singular probe
-                    // so fetch still routes on the URL git will actually use.
-                    self.effective_remote_url(remote_name, false, env)
-                        .await
-                        .map(|url| vec![url])
-                }
-            }
+            Some(urls)
         }
     }
     /// Remote names (`git remote`) under `env`. `None` on spawn/parse failure;
@@ -1692,22 +1672,40 @@ impl RealGitRepository {
             Some(remote)
         }
     }
-    /// Whether `remote_name` sets `remote.<name>.skipFetchAll` (read via
-    /// `git config --get`). Missing key / probe failure means “fetch it”.
+    /// Whether `remote_name` is skipped by `fetch --all`.
+    /// Probed via `git config --bool --get remote.<name>.skipFetchAll`, which
+    /// canonicalizes bare `skipFetchAll` (no `=`) to `true` and accepts the
+    /// usual true-set (`true`/`yes`/`on`/`1` → `true`). When the primary key
+    /// is absent, falls back to the legacy alias
+    /// `git config --bool --get remote.<name>.skipDefaultUpdate` (same
+    /// true-set). Explicit `skipFetchAll=false` wins over a lingering
+    /// alias-true (alias consulted only when primary is absent/non-true —
+    /// i.e. the `Err` probe — so a present `false` returns immediately);
+    /// both-keys-conflicting is vanishingly rare and this order is the safe
+    /// explicit-wins choice. Missing keys / probe failure means “fetch it”.
     async fn remote_skip_fetch_all(
         &self,
         remote_name: &str,
         env: &HashMap<String, String>,
     ) -> bool {
         let git = self.probe_git_with_env(env);
-        let key = format!("remote.{remote_name}.skipFetchAll");
-        match git.run(&["config", "--get", key.as_str()]).await {
-            Ok(value) => matches!(
-                value.trim().to_ascii_lowercase().as_str(),
-                "true" | "yes" | "on" | "1"
-            ),
-            Err(_) => false,
+        let primary = format!("remote.{remote_name}.skipFetchAll");
+        if let Ok(value) = git
+            .run(&["config", "--bool", "--get", primary.as_str()])
+            .await
+        {
+            // `--bool` canonicalizes to `true`/`false`; a present key decides
+            // immediately so explicit `skipFetchAll=false` wins over the alias.
+            return value.trim() == "true";
         }
+        let alias = format!("remote.{remote_name}.skipDefaultUpdate");
+        if let Ok(value) = git
+            .run(&["config", "--bool", "--get", alias.as_str()])
+            .await
+        {
+            return value.trim() == "true";
+        }
+        false
     }
     /// Whether `remote_name` needs HTTPS. Push classifies ALL `--push --all`
     /// URLs (ANY HTTPS → HTTPS); fetch/pull classify ONLY the first fetch URL
@@ -1720,7 +1718,7 @@ impl RealGitRepository {
         env: &HashMap<String, String>,
     ) -> bool {
         if for_push {
-            match self.effective_remote_urls(remote_name, true, env).await {
+            match self.effective_remote_urls(remote_name, env).await {
                 None => true,
                 Some(urls) => urls
                     .iter()
@@ -1735,10 +1733,11 @@ impl RealGitRepository {
     }
     /// Whether `fetch --all` needs HTTPS: true if ANY actually-fetched remote
     /// needs it under the first-URL rule. Remotes with
-    /// `remote.<name>.skipFetchAll=true` are skipped (git would not fetch
-    /// them). No remotes at all, or none left after filtering, is Basic:
-    /// real `git fetch --all` exits 0 without touching the network and must
-    /// not demand HTTPS. Unlistable remotes stay HTTPS (strict).
+    /// `remote.<name>.skipFetchAll` (or legacy `skipDefaultUpdate`) set are
+    /// skipped (git would not fetch them). No remotes at all, or none left
+    /// after filtering, is Basic: real `git fetch --all` exits 0 without
+    /// touching the network and must not demand HTTPS. Unlistable remotes
+    /// stay HTTPS (strict).
     async fn fetch_all_requires_https(&self, env: &HashMap<String, String>) -> bool {
         let Some(names) = self.remote_names_with_env(env).await else {
             return true;
@@ -3478,9 +3477,10 @@ impl GitRepository for RealGitRepository {
         let remote_name = format!("{}", fetch_options);
         // `FetchOptions::Remote` routes by that remote's first effective fetch
         // URL (`get-url` honors insteadOf). `--all` enumerates every
-        // actually-fetched remote (skipping `skipFetchAll=true`) and needs
-        // HTTPS only if >=1 first URL needs it (SSH-only stays Basic; no
-        // remotes is Basic since real `git fetch --all` exits 0).
+        // actually-fetched remote (skipping `skipFetchAll`, alias
+        // `skipDefaultUpdate`) and needs HTTPS only if >=1 first URL needs it
+        // (SSH-only stays Basic; no remotes is Basic since real `git fetch
+        // --all` exits 0).
         // `--unshallow` (no remote arg) resolves the upstream default remote
         // (`branch.<current>.remote`, then `origin`) instead of forcing HTTPS.
         // Unresolvable stays HTTPS (strict). Single attempt, never fallback on
@@ -8303,13 +8303,22 @@ mod tests {
         )
         .unwrap();
         let env = test_commit_envs();
-        // The `--all` probe really does see an HTTPS URL second ...
+        // The push `--push --all` probe really does see an HTTPS URL second ...
         let all_urls = repo
-            .effective_remote_urls("origin", false, &env)
+            .effective_remote_urls("origin", &env)
             .await
             .expect("probe must resolve");
         assert_eq!(all_urls.len(), 2, "stub must expose two URLs, got {all_urls:?}");
-        // ... yet fetch routing looks only at the first (SSH) URL.
+        // ... yet fetch routing looks only at the singular first (SSH) URL.
+        let first = repo
+            .effective_remote_url("origin", false, &env)
+            .await
+            .expect("singular probe must resolve");
+        assert_eq!(
+            classify_remote_url(&first),
+            RemoteCapability::Basic,
+            "singular first URL must be SSH, got {first:?}"
+        );
         assert!(
             !repo.remote_requires_https("origin", false, &env).await,
             "fetch must classify only the first URL (SSH → Basic), got {all_urls:?}"
@@ -8448,10 +8457,79 @@ mod tests {
         );
     }
 
-    /// Old git without `get-url --all`: `Err` (unsupported flag) falls back
-    /// to singular `get-url` for fetch, but push stays HTTPS strict — an
-    /// undeterminable full push-URL list could hide an HTTPS `pushurl`, so it
-    /// must never silently stay Basic.
+    /// Bare `skipFetchAll` (no `=`) canonicalizes to `true` via
+    /// `git config --bool --get`: the stub returns `true` only when `--bool`
+    /// is present (empty otherwise, as plain `--get` would for a bare key),
+    /// so only the `--bool` probe detects the skip.
+    #[cfg(unix)]
+    #[gpui::test]
+    async fn test_skip_fetch_all_bare_canonicalizes_true(cx: &mut TestAppContext) {
+        cx.executor().allow_parking();
+        let temp = tempfile::tempdir().unwrap();
+        let system = write_stub_git(
+            temp.path(),
+            "system-git",
+            false,
+            "has_geturl=0; for a in \"$@\"; do if [ \"$a\" = \"get-url\" ]; then has_geturl=1; fi; done; if [ \"$has_geturl\" = 1 ]; then echo \"git@github.com:example/origin.git\"; exit 0; fi\nhas_config=0; has_bool=0; is_primary=0; for a in \"$@\"; do if [ \"$a\" = \"config\" ]; then has_config=1; fi; if [ \"$a\" = \"--bool\" ]; then has_bool=1; fi; if [ \"$a\" = \"remote.origin.skipFetchAll\" ]; then is_primary=1; fi; done; if [ \"$has_config\" = 1 ] && [ \"$is_primary\" = 1 ]; then if [ \"$has_bool\" = 1 ]; then echo \"true\"; exit 0; fi; exit 0; fi\nfor a in \"$@\"; do if [ \"$a\" = \"remote\" ]; then echo \"origin\"; exit 0; fi; done\nexit 0",
+        );
+        let dotgit = empty_dot_git(&temp.path().join("repo"));
+        let repo = RealGitRepository::new_with_secondary(
+            &dotgit,
+            None,
+            Some(system),
+            None,
+            cx.executor(),
+        )
+        .unwrap();
+        let env = test_commit_envs();
+        assert!(
+            repo.remote_skip_fetch_all("origin", &env).await,
+            "bare skipFetchAll (no `=`) must canonicalize to skipped via --bool"
+        );
+        assert!(
+            !repo.fetch_all_requires_https(&env).await,
+            "fetch --all with only a bare-skipped remote left must stay Basic"
+        );
+    }
+
+    /// Legacy alias `skipDefaultUpdate=true` is honored when the primary
+    /// `skipFetchAll` key is absent: the stub exits 1 for the primary probe
+    /// and returns `true` for the alias `--bool` probe.
+    #[cfg(unix)]
+    #[gpui::test]
+    async fn test_skip_fetch_all_legacy_alias(cx: &mut TestAppContext) {
+        cx.executor().allow_parking();
+        let temp = tempfile::tempdir().unwrap();
+        let system = write_stub_git(
+            temp.path(),
+            "system-git",
+            false,
+            "has_geturl=0; for a in \"$@\"; do if [ \"$a\" = \"get-url\" ]; then has_geturl=1; fi; done; if [ \"$has_geturl\" = 1 ]; then echo \"git@github.com:example/origin.git\"; exit 0; fi\nhas_config=0; has_bool=0; is_primary=0; is_alias=0; for a in \"$@\"; do if [ \"$a\" = \"config\" ]; then has_config=1; fi; if [ \"$a\" = \"--bool\" ]; then has_bool=1; fi; if [ \"$a\" = \"remote.origin.skipFetchAll\" ]; then is_primary=1; fi; if [ \"$a\" = \"remote.origin.skipDefaultUpdate\" ]; then is_alias=1; fi; done; if [ \"$has_config\" = 1 ] && [ \"$is_primary\" = 1 ]; then exit 1; fi; if [ \"$has_config\" = 1 ] && [ \"$is_alias\" = 1 ]; then if [ \"$has_bool\" = 1 ]; then echo \"true\"; exit 0; fi; exit 1; fi\nfor a in \"$@\"; do if [ \"$a\" = \"remote\" ]; then echo \"origin\"; exit 0; fi; done\nexit 0",
+        );
+        let dotgit = empty_dot_git(&temp.path().join("repo"));
+        let repo = RealGitRepository::new_with_secondary(
+            &dotgit,
+            None,
+            Some(system),
+            None,
+            cx.executor(),
+        )
+        .unwrap();
+        let env = test_commit_envs();
+        assert!(
+            repo.remote_skip_fetch_all("origin", &env).await,
+            "legacy skipDefaultUpdate=true must be detected as skipped"
+        );
+        assert!(
+            !repo.fetch_all_requires_https(&env).await,
+            "fetch --all with only an alias-skipped remote left must stay Basic"
+        );
+    }
+
+    /// Old git without `get-url --push --all`: push `Err` (unsupported flag)
+    /// stays HTTPS strict — an undeterminable full push-URL list could hide an
+    /// HTTPS `pushurl`, so it must never silently stay Basic. Fetch uses the
+    /// singular `get-url` probe directly (no `--all` fallback needed).
     #[cfg(unix)]
     #[gpui::test]
     async fn test_old_git_all_flag_falls_back(cx: &mut TestAppContext) {
@@ -8484,24 +8562,21 @@ mod tests {
         )
         .unwrap();
         let env = test_commit_envs();
-        // Fetch: `--all` unsupported → singular fallback (SSH → Basic).
-        let fetch_urls = repo
-            .effective_remote_urls("origin", false, &env)
+        // Fetch: singular probe (SSH → Basic); no `--all` involved.
+        let fetch_url = repo
+            .effective_remote_url("origin", false, &env)
             .await
-            .expect("old-git fetch must fall back to the singular probe");
-        assert_eq!(
-            fetch_urls,
-            vec!["git@github.com:example/project.git".to_string()]
-        );
+            .expect("old-git fetch must resolve via the singular probe");
+        assert_eq!(fetch_url, "git@github.com:example/project.git".to_string());
         assert!(
             !repo.remote_requires_https("origin", false, &env).await,
-            "old-git SSH fetch must stay Basic via the singular fallback"
+            "old-git SSH fetch must stay Basic via the singular probe"
         );
         let (fetch_path, _) = repo.remote_binary_for("origin", false, &env).await.unwrap();
         assert_eq!(fetch_path, system);
         // Push: undeterminable full list → UNKNOWN strict (HTTPS).
         assert_eq!(
-            repo.effective_remote_urls("origin", true, &env).await,
+            repo.effective_remote_urls("origin", &env).await,
             None,
             "old-git push must not fall back to singular (could miss an HTTPS pushurl)"
         );
@@ -8601,7 +8676,7 @@ mod tests {
             "plain env must classify Basic, got {plain_single:?}"
         );
         let plain_urls = repo
-            .effective_remote_urls("origin", false, &plain_env)
+            .effective_remote_urls("origin", &plain_env)
             .await
             .expect("plain probe must resolve");
         assert!(
@@ -8618,7 +8693,7 @@ mod tests {
             "command env insteadOf must reclassify to HTTPS, got {https_single:?}"
         );
         let https_urls = repo
-            .effective_remote_urls("origin", false, &https_env)
+            .effective_remote_urls("origin", &https_env)
             .await
             .expect("command-env probe must resolve");
         assert!(
