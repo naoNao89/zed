@@ -430,7 +430,19 @@ fn main() {
             None
         };
     if let Some(git_binary_path) = &git_binary_path {
-        log::info!("Using git binary path: {:?}", git_binary_path);
+        // Keep format identical to repository/store/fs logs so they agree:
+        // resolved path + `source=` + `reason=validated|fallback-missing-helper`.
+        if git::git_binary::has_remote_https_helper(git_binary_path) {
+            log::info!(
+                "Using git binary path: {:?} source=bundled reason=validated",
+                git_binary_path
+            );
+        } else {
+            log::error!(
+                "Bundled git binary at {:?} lacks the `remote-https` helper; remote operations may fall back or fail",
+                git_binary_path
+            );
+        }
     }
 
     let fs = RealFs::new(git_binary_path, app.background_executor());

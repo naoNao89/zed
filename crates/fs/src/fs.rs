@@ -32,7 +32,7 @@ use std::mem::MaybeUninit;
 
 use async_tar::Archive;
 use futures::{AsyncRead, Stream, StreamExt, future::BoxFuture};
-use git::repository::{GitRepository, RealGitRepository};
+use git::repository::{GitRepository, RealGitRepository, select_git_binary_with_info};
 #[cfg(windows)]
 use is_executable::IsExecutable;
 use rope::Rope;
@@ -186,6 +186,11 @@ pub trait Fs: Send + Sync {
         abs_dot_git: &Path,
         system_git_binary_path: Option<&Path>,
     ) -> Result<Arc<dyn GitRepository>>;
+    /// Bundled auxiliary `git` binary (macOS app bundle), if present.
+    /// Used by `select_git_binary` ordering: system if valid → bundled if valid.
+    fn bundled_git_binary_path(&self) -> Option<PathBuf> {
+        None
+    }
     async fn git_init(&self, abs_work_directory: &Path, fallback_branch_name: String)
     -> Result<()>;
     async fn git_clone(&self, abs_work_directory: &Path, repo_url: &str) -> Result<()>;
@@ -582,6 +587,44 @@ impl RealFs {
             trash: Arc::new(Mutex::new(SlotMap::with_key())),
             is_case_sensitive: Default::default(),
         })
+    }
+    /// Validated selection via `select_git_binary_with_info`:
+    /// system (`PATH` `git`) if usable → bundled aux if usable → bail.
+    /// Usable = launches and ships `remote-https` helper. Fallback only on
+    /// missing/spawn/helper-missing; never on auth/network/non-zero exit.
+    /// Constraint from #37757 (reverted by #37828): never pin clone/init to a
+    /// bare `"git"` string nor to an unvalidated system path; every
+    /// `git_clone`/`git_init`/`git_config` spawn must go through this
+    /// resolver (see issue #57862 `git: 'remote-https' is not a git command`).
+    fn resolve_git_binary(&self) -> Result<(PathBuf, &'static str)> {
+        let system = which::which("git").ok();
+        let bundled = self.bundled_git_binary_path.clone();
+        match select_git_binary_with_info(system, bundled) {
+            Ok(selected) => {
+                log::info!(
+                    "selected git binary {:?} source={} reason={}",
+                    selected.path,
+                    selected.source,
+                    selected.reason
+                );
+                Ok((selected.path, selected.source))
+            }
+            Err(e) => Err(e),
+        }
+    }
+
+    fn fallback_git_binary(&self, primary_source: &str) -> Option<(PathBuf, &'static str)> {
+        // Primary was already validated; only a spawn race can land here.
+        // Retry only with the other candidate when it validates.
+        if primary_source == "system" {
+            let bundled = self.bundled_git_binary_path.clone()?;
+            if git::git_binary::has_remote_https_helper(&bundled) {
+                return Some((bundled, "bundled"));
+            }
+            None
+        } else {
+            None
+        }
     }
 
     #[cfg(target_os = "windows")]
@@ -1244,17 +1287,40 @@ impl Fs for RealFs {
             self.executor.clone(),
         )?))
     }
+    fn bundled_git_binary_path(&self) -> Option<PathBuf> {
+        self.bundled_git_binary_path.clone()
+    }
 
     async fn git_init(
         &self,
         abs_work_directory_path: &Path,
         fallback_branch_name: String,
     ) -> Result<()> {
-        let result = new_command("git")
-            .current_dir(abs_work_directory_path)
-            .args(&["config", "--global", "--get", "init.defaultBranch"])
-            .output()
-            .await;
+        let (git_binary, source) = self.resolve_git_binary()?;
+        async fn run_config_get(binary: PathBuf, dir: PathBuf) -> std::io::Result<std::process::Output> {
+            new_command(&binary)
+                .current_dir(&dir)
+                .args(&["config", "--global", "--get", "init.defaultBranch"])
+                .output()
+                .await
+        }
+        let work_dir = abs_work_directory_path.to_path_buf();
+        // Fallback only on spawn failure; a non-zero exit (unset value) uses
+        // `fallback_branch_name` without switching binaries.
+        let result = match run_config_get(git_binary, work_dir.clone()).await {
+            Err(_) => match self.fallback_git_binary(source) {
+                Some((fallback_binary, fallback_source)) => {
+                    log::info!(
+                        "selected git binary {:?} source={} reason=fallback-spawn-failure for git_init config",
+                        fallback_binary,
+                        fallback_source
+                    );
+                    run_config_get(fallback_binary, work_dir).await
+                }
+                None => return Err(anyhow::anyhow!("failed to spawn git config")),
+            },
+            ok => ok,
+        };
 
         // In case the `git config` command fails, which would be the case if
         // the user doesn't have an `init.defaultBranch` value set, we'll just
@@ -1264,12 +1330,33 @@ impl Fs for RealFs {
             _ => fallback_branch_name,
         };
 
-        new_command("git")
+        let (git_binary, source) = self.resolve_git_binary()?;
+        let init_output = match new_command(&git_binary)
             .current_dir(abs_work_directory_path)
             .args(&["init", "-b"])
             .arg(branch_name.trim())
             .output()
-            .await?;
+            .await
+        {
+            Err(_) => match self.fallback_git_binary(source) {
+                Some((fallback_binary, fallback_source)) => {
+                    log::info!(
+                        "selected git binary {:?} source={} reason=fallback-spawn-failure for git_init",
+                        fallback_binary,
+                        fallback_source
+                    );
+                    new_command(&fallback_binary)
+                        .current_dir(abs_work_directory_path)
+                        .args(&["init", "-b"])
+                        .arg(branch_name.trim())
+                        .output()
+                        .await?
+                }
+                None => return Err(anyhow::anyhow!("failed to spawn git init")),
+            },
+            ok => ok?,
+        };
+        let _ = init_output;
 
         Ok(())
     }
@@ -1283,13 +1370,36 @@ impl Fs for RealFs {
         };
 
         let job_tracker = JobTracker::new(job_info, self.job_event_subscribers.clone());
-        let mut child = new_command("git")
+        let (git_binary, source) = self.resolve_git_binary()?;
+        // Fallback only on spawn failure; a non-zero exit (e.g. auth failure)
+        // must surface without switching binaries.
+        let mut child = match new_command(&git_binary)
             .current_dir(abs_work_directory)
             .args(["clone", "--progress", repo_url])
             .stdout(Stdio::null())
             .stderr(Stdio::piped())
             .kill_on_drop(true)
-            .spawn()?;
+            .spawn()
+        {
+            Err(_) => {
+                let (fallback_binary, fallback_source) = self
+                    .fallback_git_binary(source)
+                    .context("failed to spawn git clone and no fallback binary")?;
+                log::info!(
+                    "selected git binary {:?} source={} reason=fallback-spawn-failure for git_clone",
+                    fallback_binary,
+                    fallback_source
+                );
+                new_command(&fallback_binary)
+                    .current_dir(abs_work_directory)
+                    .args(["clone", "--progress", repo_url])
+                    .stdout(Stdio::null())
+                    .stderr(Stdio::piped())
+                    .kill_on_drop(true)
+                    .spawn()?
+            }
+            ok => ok?,
+        };
         let stderr = child
             .stderr
             .take()
@@ -1314,11 +1424,30 @@ impl Fs for RealFs {
     /// Will return `Ok` if the commands exit status is `0`, with the stdout
     /// contents. Otherwise returns `Err` with the stderr contents.
     async fn git_config(&self, abs_work_directory: &Path, args: Vec<String>) -> Result<String> {
-        let output = new_command("git")
+        let (git_binary, source) = self.resolve_git_binary()?;
+        let output = match new_command(&git_binary)
             .current_dir(abs_work_directory)
-            .args([String::from("config")].into_iter().chain(args))
+            .args([String::from("config")].into_iter().chain(args.clone()))
             .output()
-            .await?;
+            .await
+        {
+            Err(_) => {
+                let (fallback_binary, fallback_source) = self
+                    .fallback_git_binary(source)
+                    .context("failed to spawn git config and no fallback binary")?;
+                log::info!(
+                    "selected git binary {:?} source={} reason=fallback-spawn-failure for git_config",
+                    fallback_binary,
+                    fallback_source
+                );
+                new_command(&fallback_binary)
+                    .current_dir(abs_work_directory)
+                    .args([String::from("config")].into_iter().chain(args))
+                    .output()
+                    .await?
+            }
+            ok => ok?,
+        };
 
         if !output.status.success() {
             let err = String::from_utf8(output.stderr)?;

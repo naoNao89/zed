@@ -781,16 +781,56 @@ impl LocalRepositoryState {
                     HashMap::default()
                 });
         let search_paths = environment.get("PATH").map(|val| val.to_owned());
+        // Bundled aux binary for `select_git_binary` ordering (system → bundled).
+        let bundled_git_binary_path = fs.bundled_git_binary_path();
         let backend = cx
             .background_spawn({
                 let fs = fs.clone();
                 async move {
-                    let system_git_binary_path = search_paths
+                    // Preserve login-shell `search_paths` first, then process PATH.
+                    // Constraint from #37757 (reverted by #37828): keep
+                    // `which_in(search_paths)` + `which("git")` behavior, only
+                    // add validation + bundled fallback. Do not re-pin
+                    // fetch/push/pull to a raw `"git"` string or to an
+                    // unvalidated system path (see issue #57862
+                    // `git: 'remote-https' is not a git command`).
+                    let primary = search_paths
                         .and_then(|search_paths| {
                             which::which_in("git", Some(search_paths), &work_directory_abs_path)
                                 .ok()
-                        })
-                        .or_else(|| which::which("git").ok());
+                        });
+                    let secondary = which::which("git").ok();
+                    // 3-tier validated order: login-shell git if usable, else
+                    // process-PATH git if usable, else bundled if usable.
+                    // Usable = launches and ships `remote-https` helper
+                    // (`has_remote_https_helper`); fallback only on
+                    // missing/spawn/helper-missing, never auth/network/non-zero.
+                    let system_git_binary_path = if let Some(ref candidate) = primary {
+                        if git::repository::has_remote_https_helper(candidate) {
+                            primary
+                        } else {
+                            secondary.filter(|candidate| {
+                                git::repository::has_remote_https_helper(candidate)
+                            })
+                        }
+                    } else {
+                        secondary
+                    };
+                    // Validated selection: system if usable → bundled if usable → bail.
+                    // `select_git_binary_with_info` re-validates, so this log
+                    // agrees with `RealGitRepository::new` (`opening git
+                    // repository ... using git binary ... source= reason=`).
+                    let selected = git::repository::select_git_binary_with_info(
+                        system_git_binary_path.clone(),
+                        bundled_git_binary_path.clone(),
+                    )?;
+                    log::info!(
+                        "opening git repository at {:?} using git binary {:?} source={} reason={}",
+                        dot_git_abs_path,
+                        selected.path,
+                        selected.source,
+                        selected.reason
+                    );
                     fs.open_repo(&dot_git_abs_path, system_git_binary_path.as_deref())
                         .with_context(|| format!("opening repository at {dot_git_abs_path:?}"))
                 }

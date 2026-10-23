@@ -6664,6 +6664,7 @@ dependencies = [
  "trash",
  "unicode-normalization",
  "util",
+ "which",
  "windows 0.62.2",
 ]
 

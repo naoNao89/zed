@@ -42,6 +42,9 @@ use util::rel_path::RelPath;
 use util::{ResultExt, paths};
 use uuid::Uuid;
 
+pub use crate::git_binary::{
+    SelectedGitBinary, has_remote_https_helper, select_git_binary, select_git_binary_with_info,
+};
 pub use askpass::{AskPassDelegate, AskPassResult, AskPassSession};
 
 pub const REMOTE_CANCELLED_BY_USER: &str = "Operation cancelled by user";
@@ -1179,6 +1182,7 @@ pub struct RealGitRepository {
     /// `None` only for bare repositories, which do not have a working directory.
     pub working_directory: Option<PathBuf>,
     pub system_git_binary_path: Option<PathBuf>,
+    pub bundled_git_binary_path: Option<PathBuf>,
     pub any_git_binary_path: PathBuf,
     any_git_binary_help_output: Arc<Mutex<Option<SharedString>>>,
     executor: BackgroundExecutor,
@@ -1220,12 +1224,15 @@ impl RealGitRepository {
         system_git_binary_path: Option<PathBuf>,
         executor: BackgroundExecutor,
     ) -> Result<Self> {
-        let any_git_binary_path = system_git_binary_path
-            .clone()
-            .or(bundled_git_binary_path)
-            .context("no git binary available")?;
+        let selected = select_git_binary_with_info(
+            system_git_binary_path.clone(),
+            bundled_git_binary_path.clone(),
+        )?;
+        let any_git_binary_path = selected.path;
         log::info!(
-            "opening git repository at {dotgit_path:?} using git binary {any_git_binary_path:?}"
+            "opening git repository at {dotgit_path:?} using git binary {any_git_binary_path:?} source={} reason={}",
+            selected.source,
+            selected.reason,
         );
         let dotgit_parent = dotgit_path.parent().context(".git has no parent")?;
         let has_working_directory =
@@ -1277,6 +1284,7 @@ impl RealGitRepository {
             common_dir,
             working_directory,
             system_git_binary_path,
+            bundled_git_binary_path,
             any_git_binary_path,
             executor,
             any_git_binary_help_output: Arc::new(Mutex::new(None)),
@@ -1314,6 +1322,21 @@ impl RealGitRepository {
             self.executor.clone(),
             self.is_trusted(),
         )
+    }
+    /// Validated binary for remote ops (`push`/`pull`/`fetch`) plus a
+    /// precomputed `tried ...` hint for error messages.
+    ///
+    /// The path is `any_git_binary_path`, resolved at construction via
+    /// `select_git_binary` (system with `remote-https` helper, else bundled).
+    /// Remote-command failures (auth/network/non-zero exit) must never trigger
+    /// a fallback to the other binary, so callers use the returned path directly.
+    fn remote_git_binary(&self) -> (PathBuf, String) {
+        let path = self.any_git_binary_path.clone();
+        let tried = format!(
+            "tried system={:?}, bundled={:?}",
+            self.system_git_binary_path, self.bundled_git_binary_path
+        );
+        (path, tried)
     }
 
     fn edit_ref(&self, edit: RefEdit) -> BoxFuture<'_, Result<()>> {
@@ -1368,7 +1391,15 @@ pub async fn get_git_committer(cx: &AsyncApp) -> GitCommitter {
         };
     }
 
-    let git_binary_path =
+    // Single resolution order (system-validated → bundled), matching
+    // `select_git_binary` used by `RealGitRepository::new` and the
+    // `LocalRepositoryState`/`RealFs` callsites.
+    // Constraint from #37757 (reverted by #37828): never pin to a bare
+    // `"git"` string nor to an unvalidated system path; each candidate must
+    // pass `has_remote_https_helper` (missing/spawn/helper-missing falls
+    // back, never auth/network/non-zero). See issue #57862
+    // (`git: 'remote-https' is not a git command`).
+    let bundled_git_binary_path =
         if cfg!(target_os = "macos") && option_env!("ZED_BUNDLE").as_deref() == Some("true") {
             cx.update(|cx| {
                 cx.path_for_auxiliary_executable("git")
@@ -1378,9 +1409,35 @@ pub async fn get_git_committer(cx: &AsyncApp) -> GitCommitter {
         } else {
             None
         };
+    // `PathBuf::from("git")` resolves via PATH at spawn time, so validating
+    // it with `has_remote_https_helper` validates the process-PATH system git
+    // without needing a `which` dependency in this crate.
+    let system_git_binary_path = Some(PathBuf::from("git"));
+    let git_binary_path = match select_git_binary_with_info(
+        system_git_binary_path,
+        bundled_git_binary_path.clone(),
+    ) {
+        Ok(selected) => {
+            log::info!(
+                "selected git binary {:?} source={} reason={} for git committer",
+                selected.path,
+                selected.source,
+                selected.reason
+            );
+            selected.path
+        }
+        Err(e) => {
+            // Best-effort: committer only fills user.name/email; a broken setup
+            // surfaces as `None` via `log_err()` below, not a hard error.
+            log::warn!(
+                "no usable git binary for committer (tried system=Some(\"git\"), bundled={bundled_git_binary_path:?}): {e:?}; falling back to PATH git source=path-fallback reason=no-usable-binary"
+            );
+            PathBuf::from("git")
+        }
+    };
 
     let git = GitBinary::new(
-        git_binary_path.unwrap_or(PathBuf::from("git")),
+        git_binary_path,
         paths::home_dir().clone(),
         paths::home_dir().join(".git"),
         cx.background_executor().clone(),
@@ -2849,14 +2906,16 @@ impl GitRepository for RealGitRepository {
         let working_directory = self.command_directory();
         let git_directory = self.path();
         let executor = cx.background_executor().clone();
-        let git_binary_path = self.system_git_binary_path.clone();
+        // Validated at construction via `select_git_binary`: the system binary is
+        // used only when it ships the `remote-https` helper, otherwise the
+        // bundled binary. Never fall back on auth/network failures below.
+        let (git_binary_path, tried_binaries) = self.remote_git_binary();
         let is_trusted = self.is_trusted();
         // Note: Do not spawn this command on the background thread, it might pop open the credential helper
         // which we want to block on.
         async move {
-            let git_binary_path = git_binary_path.context("git not found on $PATH, can't push")?;
             let git = GitBinary::new(
-                git_binary_path,
+                git_binary_path.clone(),
                 working_directory,
                 git_directory,
                 executor.clone(),
@@ -2875,7 +2934,13 @@ impl GitRepository for RealGitRepository {
                 .stdout(Stdio::piped())
                 .stderr(Stdio::piped());
 
-            run_git_command(env, ask_pass, command, executor).await
+            run_git_command(env, ask_pass, command, executor)
+                .await
+                .with_context(|| {
+                    format!(
+                        "git push failed using git binary {git_binary_path:?} ({tried_binaries})"
+                    )
+                })
         }
         .boxed()
     }
@@ -2892,14 +2957,14 @@ impl GitRepository for RealGitRepository {
         let working_directory = self.command_directory();
         let git_directory = self.path();
         let executor = cx.background_executor().clone();
-        let git_binary_path = self.system_git_binary_path.clone();
+        // Validated at construction via `select_git_binary` (see `push`).
+        let (git_binary_path, tried_binaries) = self.remote_git_binary();
         let is_trusted = self.is_trusted();
         // Note: Do not spawn this command on the background thread, it might pop open the credential helper
         // which we want to block on.
         async move {
-            let git_binary_path = git_binary_path.context("git not found on $PATH, can't pull")?;
             let git = GitBinary::new(
-                git_binary_path,
+                git_binary_path.clone(),
                 working_directory,
                 git_directory,
                 executor.clone(),
@@ -2918,7 +2983,13 @@ impl GitRepository for RealGitRepository {
                 .stdout(Stdio::piped())
                 .stderr(Stdio::piped());
 
-            run_git_command(env, ask_pass, command, executor).await
+            run_git_command(env, ask_pass, command, executor)
+                .await
+                .with_context(|| {
+                    format!(
+                        "git pull failed using git binary {git_binary_path:?} ({tried_binaries})"
+                    )
+                })
         }
         .boxed()
     }
@@ -2933,15 +3004,15 @@ impl GitRepository for RealGitRepository {
         let working_directory = self.command_directory();
         let git_directory = self.path();
         let remote_name = format!("{}", fetch_options);
-        let git_binary_path = self.system_git_binary_path.clone();
+        // Validated at construction via `select_git_binary` (see `push`).
+        let (git_binary_path, tried_binaries) = self.remote_git_binary();
         let executor = cx.background_executor().clone();
         let is_trusted = self.is_trusted();
         // Note: Do not spawn this command on the background thread, it might pop open the credential helper
         // which we want to block on.
         async move {
-            let git_binary_path = git_binary_path.context("git not found on $PATH, can't fetch")?;
             let git = GitBinary::new(
-                git_binary_path,
+                git_binary_path.clone(),
                 working_directory,
                 git_directory,
                 executor.clone(),
@@ -2953,7 +3024,13 @@ impl GitRepository for RealGitRepository {
                 .stdout(Stdio::piped())
                 .stderr(Stdio::piped());
 
-            run_git_command(env, ask_pass, command, executor).await
+            run_git_command(env, ask_pass, command, executor)
+                .await
+                .with_context(|| {
+                    format!(
+                        "git fetch failed using git binary {git_binary_path:?} ({tried_binaries})"
+                    )
+                })
         }
         .boxed()
     }
@@ -7089,6 +7166,365 @@ mod tests {
         assert_eq!(
             remote_urls.get("upstream").unwrap(),
             "/Users/user/My Projects/upstream.git"
+        );
+    }
+
+    // Regression tests for `git: 'remote-https' is not a git command` (broken
+    // PATH git selected without checking for its `git-remote-https` helper).
+    //
+    // Contract under test (resolver slice owns the implementation):
+    // - `select_git_binary(system, bundled)`: system if usable, else bundled
+    //   if usable, else `bail!("no usable git binary ...")`. Usable = the
+    //   binary launches and its `--exec-path` directory contains an executable
+    //   `git-remote-https` (honoring `GIT_EXEC_PATH`). No network involved.
+    // - Fallback happens ONLY on missing binary / spawn failure / missing
+    //   helper. A launched git that exits non-zero (auth/network failure) must
+    //   surface its error; the other binary must NOT be tried.
+    //
+    // MANUAL CHECK (`zed: open log`): after the logging slices land, the
+    // `Using git binary path: ...` line (main.rs) and the
+    // `opening git repository ... using git binary ...` line (repository.rs)
+    // must print the identical resolved path plus
+    // `source=system|bundled reason=validated|fallback-missing-helper`.
+    // These tests pin the data-level invariant both lines must print:
+    // `RealGitRepository::new(...).any_git_binary_path`.
+    /// Writes a hermetic stub `git` executable. The stub answers
+    /// `git --exec-path` with a directory that either contains an executable
+    /// `git-remote-https` (healthy) or not (broken), and runs `body` for
+    /// every other invocation.
+    #[cfg(unix)]
+    fn write_stub_git(dir: &Path, name: &str, with_helper: bool, body: &str) -> PathBuf {
+        use std::os::unix::fs::PermissionsExt as _;
+        let exec_dir = dir.join(format!("{name}-exec"));
+        fs::create_dir_all(&exec_dir).unwrap();
+        if with_helper {
+            let helper = exec_dir.join("git-remote-https");
+            fs::write(&helper, "#!/bin/sh\nexit 0\n").unwrap();
+            fs::set_permissions(&helper, fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let git_path = dir.join(name);
+        let script = format!(
+            "#!/bin/sh\nif [ \"$1\" = \"--exec-path\" ]; then echo \"{}\"; exit 0; fi\n{body}\n",
+            exec_dir.display()
+        );
+        fs::write(&git_path, script).unwrap();
+        fs::set_permissions(&git_path, fs::Permissions::from_mode(0o755)).unwrap();
+        git_path
+    }
+
+    #[cfg(unix)]
+    fn empty_dot_git(dir: &Path) -> PathBuf {
+        let dotgit = dir.join(".git");
+        fs::create_dir_all(&dotgit).unwrap();
+        dotgit
+    }
+
+    /// System git without `git-remote-https` must NOT be selected: resolution
+    /// falls back to the healthy bundled git.
+    /// FAILS before the resolver fix (`any_git_binary_path` is the broken
+    /// system stub); PASSES after (it is the bundled stub).
+    #[cfg(unix)]
+    #[gpui::test]
+    async fn test_git_binary_falls_back_to_bundled_when_system_lacks_remote_https(
+        cx: &mut TestAppContext,
+    ) {
+        cx.executor().allow_parking();
+        let temp = tempfile::tempdir().unwrap();
+        let system = write_stub_git(temp.path(), "system-git", false, "exit 0");
+        let bundled = write_stub_git(temp.path(), "bundled-git", true, "exit 0");
+        let dotgit = empty_dot_git(&temp.path().join("repo"));
+
+        let repo =
+            RealGitRepository::new(&dotgit, Some(bundled.clone()), Some(system), cx.executor())
+                .unwrap();
+        assert_eq!(repo.any_git_binary_path, bundled);
+    }
+
+    /// A healthy system git keeps priority over the bundled one.
+    /// Passes before and after the fix (guardrail against over-eager fallback).
+    #[cfg(unix)]
+    #[gpui::test]
+    async fn test_git_binary_prefers_healthy_system_binary(cx: &mut TestAppContext) {
+        cx.executor().allow_parking();
+        let temp = tempfile::tempdir().unwrap();
+        let system = write_stub_git(temp.path(), "system-git", true, "exit 0");
+        let bundled = write_stub_git(temp.path(), "bundled-git", true, "exit 0");
+        let dotgit = empty_dot_git(&temp.path().join("repo"));
+
+        let repo =
+            RealGitRepository::new(&dotgit, Some(bundled), Some(system.clone()), cx.executor())
+                .unwrap();
+        assert_eq!(repo.any_git_binary_path, system);
+    }
+
+    /// No usable binary at all (helper missing everywhere) is an error, not a
+    /// silent pick of the broken binary.
+    /// FAILS before the resolver fix (`new` returns `Ok` with the broken
+    /// path); PASSES after (`Err` containing "no usable git binary").
+    #[cfg(unix)]
+    #[gpui::test]
+    async fn test_git_binary_selection_errors_when_no_binary_has_remote_https(
+        cx: &mut TestAppContext,
+    ) {
+        cx.executor().allow_parking();
+        let temp = tempfile::tempdir().unwrap();
+        let system = write_stub_git(temp.path(), "system-git", false, "exit 0");
+        let dotgit = empty_dot_git(&temp.path().join("repo"));
+
+        let err = RealGitRepository::new(&dotgit, None, Some(system), cx.executor())
+            .err()
+            .expect("expected RealGitRepository::new to fail without a usable git binary");
+        assert!(
+            err.to_string().contains("no usable git binary"),
+            "unexpected error: {err:#}"
+        );
+    }
+
+    /// A launched git that exits non-zero (auth/network failure) surfaces its
+    /// error; the other binary must NOT be tried as a fallback.
+    /// Passes before and after the fix (guardrail: the new fallback must only
+    /// fire pre-launch on missing binary / spawn failure / missing helper).
+    #[cfg(unix)]
+    #[gpui::test]
+    async fn test_git_remote_auth_failure_surfaces_without_falling_back(cx: &mut TestAppContext) {
+        cx.executor().allow_parking();
+        let temp = tempfile::tempdir().unwrap();
+        // Healthy system stub whose remote operations fail like an
+        // auth/network failure: the process launches fine, then exits non-zero.
+        let system = write_stub_git(
+            temp.path(),
+            "system-git",
+            true,
+            "echo \"fatal: Authentication failed for 'https://example.com/repo.git'\" >&2; exit 128",
+        );
+        // Bundled stub records any invocation in `bundled_invoked`.
+        let invoked = temp.path().join("bundled_invoked");
+        let bundled = write_stub_git(
+            temp.path(),
+            "bundled-git",
+            true,
+            &format!("touch \"{}\"; exit 0", invoked.display()),
+        );
+        let dotgit = empty_dot_git(&temp.path().join("repo"));
+
+        // Selection still prefers the healthy system binary ...
+        let repo =
+            RealGitRepository::new(&dotgit, Some(bundled), Some(system), cx.executor()).unwrap();
+
+        // ... and the auth failure surfaces instead of triggering fallback.
+        let git = repo.git_binary();
+        let err = git.run(&["fetch", "origin"]).await.unwrap_err();
+        assert!(
+            err.to_string().contains("Authentication failed"),
+            "unexpected error: {err:#}"
+        );
+        assert!(
+            !invoked.exists(),
+            "bundled git must not be invoked after an auth/network failure"
+        );
+    }
+
+    /// Direct contract assertions on the resolver API: a missing system
+    /// binary falls back to a healthy bundled one (no network involved).
+    /// Complements the `RealGitRepository::new`-level fallback test above.
+    #[cfg(unix)]
+    #[test]
+    fn test_select_git_binary_falls_back_when_system_missing() {
+        let temp = tempfile::tempdir().unwrap();
+        let bundled = write_stub_git(temp.path(), "bundled-git", true, "exit 0");
+        let missing = temp.path().join("does-not-exist-git");
+
+        let selected = select_git_binary(Some(missing), Some(bundled.clone())).unwrap();
+        assert_eq!(selected, bundled);
+    }
+
+    /// Direct contract assertions on the helper probe: healthy stub → true,
+    /// helper-less stub → false, missing path → false (all fully local).
+    /// Auth/network non-zero exits cannot occur here by construction: the
+    /// probe only runs `git --exec-path` and inspects the helper file, never
+    /// a remote command (that invariant is pinned by
+    /// `test_git_remote_auth_failure_surfaces_without_falling_back` above).
+    #[cfg(unix)]
+    #[test]
+    fn test_has_remote_https_helper_validates_stub_binaries() {
+        let temp = tempfile::tempdir().unwrap();
+        let healthy = write_stub_git(temp.path(), "healthy-git", true, "exit 0");
+        let broken = write_stub_git(temp.path(), "broken-git", false, "exit 0");
+
+        assert!(has_remote_https_helper(&healthy));
+        assert!(!has_remote_https_helper(&broken));
+        assert!(!has_remote_https_helper(
+            &temp.path().join("does-not-exist-git")
+        ));
+    }
+
+    /// End-to-end regression for the macOS bundled-vs-system divergence:
+    /// `push`/`pull`/`fetch` previously pinned `system_git_binary_path` and
+    /// failed with `git: 'remote-https' is not a git command` when the PATH
+    /// git was broken, while status/diff used the validated binary. Now all
+    /// remote ops run on `any_git_binary_path` (validated at construction),
+    /// so a helper-less system git falls back to bundled for `fetch` too.
+    /// FAILS on the pre-fix `fetch` (it used the system stub directly, so the
+    /// stub's `remote-https` error below surfaced); PASSES after (the bundled
+    /// stub runs and succeeds).
+    #[cfg(unix)]
+    #[gpui::test]
+    async fn test_fetch_falls_back_to_bundled_when_system_lacks_remote_https(
+        cx: &mut TestAppContext,
+    ) {
+        cx.executor().allow_parking();
+        let temp = tempfile::tempdir().unwrap();
+        // Broken system git: launches fine but ships no `git-remote-https`
+        // helper, so a real fetch fails like the reported bug.
+        let system = write_stub_git(
+            temp.path(),
+            "system-git",
+            false,
+            "echo \"git: 'remote-https' is not a git command\" >&2; exit 128",
+        );
+        // Healthy bundled stub: records the fetch invocation, then succeeds.
+        let fetched = temp.path().join("bundled_fetch_invoked");
+        let bundled = write_stub_git(
+            temp.path(),
+            "bundled-git",
+            true,
+            &format!("touch \"{}\"; exit 0", fetched.display()),
+        );
+        let dotgit = empty_dot_git(&temp.path().join("repo"));
+
+        // Log-parity invariant: in this fallback case the
+        // `opening git repository ... using git binary ... source=bundled
+        // reason=fallback-missing-helper` line (repository.rs) and the
+        // `Using git binary path: ...` line (main.rs, which logs the bundled
+        // aux binary) must print the identical resolved path. MANUAL CHECK
+        // (`zed: open log`): both lines print this same `bundled` path.
+        let selected =
+            select_git_binary_with_info(Some(system.clone()), Some(bundled.clone())).unwrap();
+        assert_eq!(selected.source, "bundled");
+        assert_eq!(selected.reason, "fallback-missing-helper");
+        let repo =
+            RealGitRepository::new(&dotgit, Some(bundled.clone()), Some(system), cx.executor())
+                .unwrap();
+        assert_eq!(repo.any_git_binary_path, selected.path);
+        assert_eq!(repo.any_git_binary_path, bundled);
+
+        repo.fetch(
+            FetchOptions::Remote(Remote {
+                name: "origin".to_string().into(),
+            }),
+            AskPassDelegate::new(&mut cx.to_async(), |_, _, _| {}),
+            Arc::new(test_commit_envs()),
+            cx.to_async(),
+        )
+        .await
+        .unwrap();
+        assert!(
+            fetched.exists(),
+            "fetch must have run on the bundled git binary"
+        );
+    }
+
+    /// A healthy system git is used for `fetch`, leaving the bundled binary
+    /// untouched. Guardrail against over-eager fallback; passes before and
+    /// after the fix.
+    #[cfg(unix)]
+    #[gpui::test]
+    async fn test_fetch_uses_healthy_system_binary_leaving_bundled_untouched(
+        cx: &mut TestAppContext,
+    ) {
+        cx.executor().allow_parking();
+        let temp = tempfile::tempdir().unwrap();
+        let system_invoked = temp.path().join("system_fetch_invoked");
+        let system = write_stub_git(
+            temp.path(),
+            "system-git",
+            true,
+            &format!("touch \"{}\"; exit 0", system_invoked.display()),
+        );
+        let bundled_invoked = temp.path().join("bundled_fetch_invoked");
+        let bundled = write_stub_git(
+            temp.path(),
+            "bundled-git",
+            true,
+            &format!("touch \"{}\"; exit 0", bundled_invoked.display()),
+        );
+        let dotgit = empty_dot_git(&temp.path().join("repo"));
+
+        let repo =
+            RealGitRepository::new(&dotgit, Some(bundled), Some(system.clone()), cx.executor())
+                .unwrap();
+        assert_eq!(repo.any_git_binary_path, system);
+
+        repo.fetch(
+            FetchOptions::Remote(Remote {
+                name: "origin".to_string().into(),
+            }),
+            AskPassDelegate::new(&mut cx.to_async(), |_, _, _| {}),
+            Arc::new(test_commit_envs()),
+            cx.to_async(),
+        )
+        .await
+        .unwrap();
+        assert!(
+            system_invoked.exists(),
+            "fetch must have run on the system git binary"
+        );
+        assert!(
+            !bundled_invoked.exists(),
+            "a healthy system git must not trigger bundled fallback"
+        );
+    }
+
+    /// Auth/network failure on a healthy binary surfaces through the public
+    /// `fetch` path (not just `GitBinary::run`); the bundled binary is never
+    /// tried. Passes before and after the fix (pins the
+    /// never-fallback-after-launch invariant for `run_git_command`).
+    #[cfg(unix)]
+    #[gpui::test]
+    async fn test_fetch_auth_failure_surfaces_without_falling_back(cx: &mut TestAppContext) {
+        cx.executor().allow_parking();
+        let temp = tempfile::tempdir().unwrap();
+        let system = write_stub_git(
+            temp.path(),
+            "system-git",
+            true,
+            "echo \"fatal: Authentication failed for 'https://example.com/repo.git'\" >&2; exit 128",
+        );
+        let bundled_invoked = temp.path().join("bundled_fetch_invoked");
+        let bundled = write_stub_git(
+            temp.path(),
+            "bundled-git",
+            true,
+            &format!("touch \"{}\"; exit 0", bundled_invoked.display()),
+        );
+        let dotgit = empty_dot_git(&temp.path().join("repo"));
+
+        let repo =
+            RealGitRepository::new(&dotgit, Some(bundled), Some(system), cx.executor()).unwrap();
+
+        let err = repo
+            .fetch(
+                FetchOptions::Remote(Remote {
+                    name: "origin".to_string().into(),
+                }),
+                AskPassDelegate::new(&mut cx.to_async(), |_, _, _| {}),
+                Arc::new(test_commit_envs()),
+                cx.to_async(),
+            )
+            .await
+            .unwrap_err();
+        let message = format!("{err:#}");
+        assert!(
+            message.contains("Authentication failed"),
+            "unexpected error: {message}"
+        );
+        assert!(
+            message.contains("git fetch failed using git binary"),
+            "fetch must name the binary it used: {message}"
+        );
+        assert!(
+            !bundled_invoked.exists(),
+            "bundled git must not be invoked after an auth/network failure"
         );
     }
 }
