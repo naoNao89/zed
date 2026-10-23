@@ -1350,6 +1350,22 @@ fn classify_remote_url(url: &str) -> RemoteCapability {
     }
     RemoteCapability::Https
 }
+/// Escapes every regex metacharacter in a remote name so it interpolates
+/// literally into the `--get-regexp` pattern used by `remote_skip_fetch_all`
+/// (remote names admit regex-significant characters such as `.`).
+fn escape_git_config_regexp(name: &str) -> String {
+    let mut escaped = String::with_capacity(name.len());
+    for ch in name.chars() {
+        if matches!(
+            ch,
+            '\\' | '.' | '^' | '$' | '*' | '+' | '?' | '(' | ')' | '[' | ']' | '{' | '}' | '|'
+        ) {
+            escaped.push('\\');
+        }
+        escaped.push(ch);
+    }
+    escaped
+}
 
 impl RealGitRepository {
     pub fn new(
@@ -1673,39 +1689,42 @@ impl RealGitRepository {
         }
     }
     /// Whether `remote_name` is skipped by `fetch --all`.
-    /// Probed via `git config --bool --get remote.<name>.skipFetchAll`, which
-    /// canonicalizes bare `skipFetchAll` (no `=`) to `true` and accepts the
-    /// usual true-set (`true`/`yes`/`on`/`1` → `true`). When the primary key
-    /// is absent, falls back to the legacy alias
-    /// `git config --bool --get remote.<name>.skipDefaultUpdate` (same
-    /// true-set). Explicit `skipFetchAll=false` wins over a lingering
-    /// alias-true (alias consulted only when primary is absent/non-true —
-    /// i.e. the `Err` probe — so a present `false` returns immediately);
-    /// both-keys-conflicting is vanishingly rare and this order is the safe
-    /// explicit-wins choice. Missing keys / probe failure means “fetch it”.
+    /// Probed with ONE ordered read on the Basic binary under the caller's
+    /// env (so `GIT_CONFIG_*` applies identically to execution):
+    /// `git config --bool --get-regexp
+    /// '^remote\.<name>\.(skipfetchall|skipdefaultupdate)$'`.
+    /// `--bool` canonicalizes bare `skipFetchAll` (no `=`) to `true` and the
+    /// usual true-set (`true`/`yes`/`on`/`1` → `true`). Real git resolves
+    /// `skipFetchAll` vs the legacy alias `skipDefaultUpdate` by config
+    /// order (last wins), and `--get-regexp` reports matches in that same
+    /// file order — so the LAST output line's value decides (`true` → skip).
+    /// Missing keys (non-zero exit) / probe failure / empty output means
+    /// “fetch it”; a present-but-unparseable trailing value is also
+    /// not-skipped (safe toward fetching, never silently skip).
     async fn remote_skip_fetch_all(
         &self,
         remote_name: &str,
         env: &HashMap<String, String>,
     ) -> bool {
         let git = self.probe_git_with_env(env);
-        let primary = format!("remote.{remote_name}.skipFetchAll");
-        if let Ok(value) = git
-            .run(&["config", "--bool", "--get", primary.as_str()])
+        let pattern = format!(
+            "^remote\\.{}\\.(skipfetchall|skipdefaultupdate)$",
+            escape_git_config_regexp(remote_name)
+        );
+        let Ok(output) = git
+            .run(&["config", "--bool", "--get-regexp", pattern.as_str()])
             .await
-        {
-            // `--bool` canonicalizes to `true`/`false`; a present key decides
-            // immediately so explicit `skipFetchAll=false` wins over the alias.
-            return value.trim() == "true";
-        }
-        let alias = format!("remote.{remote_name}.skipDefaultUpdate");
-        if let Ok(value) = git
-            .run(&["config", "--bool", "--get", alias.as_str()])
-            .await
-        {
-            return value.trim() == "true";
-        }
-        false
+        else {
+            return false;
+        };
+        // `--bool` canonicalizes each value to `true`/`false`; the last line
+        // is the config-order winner. Anything else (empty, unparseable)
+        // fetches.
+        output
+            .lines()
+            .filter_map(|line| line.split_whitespace().last())
+            .next_back()
+            == Some("true")
     }
     /// Whether `remote_name` needs HTTPS. Push classifies ALL `--push --all`
     /// URLs (ANY HTTPS → HTTPS); fetch/pull classify ONLY the first fetch URL
@@ -8357,7 +8376,7 @@ mod tests {
             "system-git",
             false,
             &format!(
-                "has_geturl=0; is_origin=0; for a in \"$@\"; do if [ \"$a\" = \"get-url\" ]; then has_geturl=1; fi; if [ \"$a\" = \"origin\" ]; then is_origin=1; fi; done; if [ \"$has_geturl\" = 1 ]; then if [ \"$is_origin\" = 1 ]; then echo \"https://github.com/example/origin.git\"; else echo \"git@github.com:example/backup.git\"; fi; exit 0; fi\nhas_config=0; origin_skip=0; backup_skip=0; for a in \"$@\"; do if [ \"$a\" = \"config\" ]; then has_config=1; fi; if [ \"$a\" = \"remote.origin.skipFetchAll\" ]; then origin_skip=1; fi; if [ \"$a\" = \"remote.backup.skipFetchAll\" ]; then backup_skip=1; fi; done; if [ \"$has_config\" = 1 ]; then if [ \"$origin_skip\" = 1 ]; then echo \"true\"; exit 0; fi; if [ \"$backup_skip\" = 1 ]; then exit 1; fi; fi\nfor a in \"$@\"; do if [ \"$a\" = \"remote\" ]; then echo \"origin\"; echo \"backup\"; exit 0; fi; done\ntouch \"{}\"; exit 0",
+                "has_geturl=0; is_origin=0; for a in \"$@\"; do if [ \"$a\" = \"get-url\" ]; then has_geturl=1; fi; if [ \"$a\" = \"origin\" ]; then is_origin=1; fi; done; if [ \"$has_geturl\" = 1 ]; then if [ \"$is_origin\" = 1 ]; then echo \"https://github.com/example/origin.git\"; else echo \"git@github.com:example/backup.git\"; fi; exit 0; fi\nhas_config=0; pat=\"\"; for a in \"$@\"; do if [ \"$a\" = \"config\" ]; then has_config=1; fi; case \"$a\" in ^remote*) pat=\"$a\";; esac; done; if [ \"$has_config\" = 1 ]; then case \"$pat\" in *origin*) echo \"remote.origin.skipfetchall true\"; exit 0;; *) exit 1;; esac; fi\nfor a in \"$@\"; do if [ \"$a\" = \"remote\" ]; then echo \"origin\"; echo \"backup\"; exit 0; fi; done\ntouch \"{}\"; exit 0",
                 system_invoked.display()
             ),
         );
@@ -8458,9 +8477,9 @@ mod tests {
     }
 
     /// Bare `skipFetchAll` (no `=`) canonicalizes to `true` via
-    /// `git config --bool --get`: the stub returns `true` only when `--bool`
-    /// is present (empty otherwise, as plain `--get` would for a bare key),
-    /// so only the `--bool` probe detects the skip.
+    /// `git config --bool --get-regexp`: the stub returns `true` only when
+    /// `--bool` is present (empty otherwise, as plain `--get` would for a
+    /// bare key), so only the `--bool` probe detects the skip.
     #[cfg(unix)]
     #[gpui::test]
     async fn test_skip_fetch_all_bare_canonicalizes_true(cx: &mut TestAppContext) {
@@ -8470,7 +8489,7 @@ mod tests {
             temp.path(),
             "system-git",
             false,
-            "has_geturl=0; for a in \"$@\"; do if [ \"$a\" = \"get-url\" ]; then has_geturl=1; fi; done; if [ \"$has_geturl\" = 1 ]; then echo \"git@github.com:example/origin.git\"; exit 0; fi\nhas_config=0; has_bool=0; is_primary=0; for a in \"$@\"; do if [ \"$a\" = \"config\" ]; then has_config=1; fi; if [ \"$a\" = \"--bool\" ]; then has_bool=1; fi; if [ \"$a\" = \"remote.origin.skipFetchAll\" ]; then is_primary=1; fi; done; if [ \"$has_config\" = 1 ] && [ \"$is_primary\" = 1 ]; then if [ \"$has_bool\" = 1 ]; then echo \"true\"; exit 0; fi; exit 0; fi\nfor a in \"$@\"; do if [ \"$a\" = \"remote\" ]; then echo \"origin\"; exit 0; fi; done\nexit 0",
+            "has_geturl=0; for a in \"$@\"; do if [ \"$a\" = \"get-url\" ]; then has_geturl=1; fi; done; if [ \"$has_geturl\" = 1 ]; then echo \"git@github.com:example/origin.git\"; exit 0; fi\nhas_config=0; has_bool=0; is_origin=0; for a in \"$@\"; do if [ \"$a\" = \"config\" ]; then has_config=1; fi; if [ \"$a\" = \"--bool\" ]; then has_bool=1; fi; case \"$a\" in ^remote*origin*) is_origin=1;; esac; done; if [ \"$has_config\" = 1 ] && [ \"$is_origin\" = 1 ]; then if [ \"$has_bool\" = 1 ]; then echo \"remote.origin.skipfetchall true\"; exit 0; fi; exit 0; fi\nfor a in \"$@\"; do if [ \"$a\" = \"remote\" ]; then echo \"origin\"; exit 0; fi; done\nexit 0",
         );
         let dotgit = empty_dot_git(&temp.path().join("repo"));
         let repo = RealGitRepository::new_with_secondary(
@@ -8492,9 +8511,9 @@ mod tests {
         );
     }
 
-    /// Legacy alias `skipDefaultUpdate=true` is honored when the primary
-    /// `skipFetchAll` key is absent: the stub exits 1 for the primary probe
-    /// and returns `true` for the alias `--bool` probe.
+    /// Legacy alias `skipDefaultUpdate=true` is honored when it is the only
+    /// key present: the stub answers the single `--get-regexp` probe with
+    /// just the alias line.
     #[cfg(unix)]
     #[gpui::test]
     async fn test_skip_fetch_all_legacy_alias(cx: &mut TestAppContext) {
@@ -8504,7 +8523,7 @@ mod tests {
             temp.path(),
             "system-git",
             false,
-            "has_geturl=0; for a in \"$@\"; do if [ \"$a\" = \"get-url\" ]; then has_geturl=1; fi; done; if [ \"$has_geturl\" = 1 ]; then echo \"git@github.com:example/origin.git\"; exit 0; fi\nhas_config=0; has_bool=0; is_primary=0; is_alias=0; for a in \"$@\"; do if [ \"$a\" = \"config\" ]; then has_config=1; fi; if [ \"$a\" = \"--bool\" ]; then has_bool=1; fi; if [ \"$a\" = \"remote.origin.skipFetchAll\" ]; then is_primary=1; fi; if [ \"$a\" = \"remote.origin.skipDefaultUpdate\" ]; then is_alias=1; fi; done; if [ \"$has_config\" = 1 ] && [ \"$is_primary\" = 1 ]; then exit 1; fi; if [ \"$has_config\" = 1 ] && [ \"$is_alias\" = 1 ]; then if [ \"$has_bool\" = 1 ]; then echo \"true\"; exit 0; fi; exit 1; fi\nfor a in \"$@\"; do if [ \"$a\" = \"remote\" ]; then echo \"origin\"; exit 0; fi; done\nexit 0",
+            "has_geturl=0; for a in \"$@\"; do if [ \"$a\" = \"get-url\" ]; then has_geturl=1; fi; done; if [ \"$has_geturl\" = 1 ]; then echo \"git@github.com:example/origin.git\"; exit 0; fi\nhas_config=0; has_bool=0; is_origin=0; for a in \"$@\"; do if [ \"$a\" = \"config\" ]; then has_config=1; fi; if [ \"$a\" = \"--bool\" ]; then has_bool=1; fi; case \"$a\" in ^remote*origin*) is_origin=1;; esac; done; if [ \"$has_config\" = 1 ] && [ \"$is_origin\" = 1 ]; then if [ \"$has_bool\" = 1 ]; then echo \"remote.origin.skipdefaultupdate true\"; exit 0; fi; exit 1; fi\nfor a in \"$@\"; do if [ \"$a\" = \"remote\" ]; then echo \"origin\"; exit 0; fi; done\nexit 0",
         );
         let dotgit = empty_dot_git(&temp.path().join("repo"));
         let repo = RealGitRepository::new_with_secondary(
@@ -8523,6 +8542,92 @@ mod tests {
         assert!(
             !repo.fetch_all_requires_https(&env).await,
             "fetch --all with only an alias-skipped remote left must stay Basic"
+        );
+    }
+
+    /// Git resolves `skipFetchAll` vs the legacy `skipDefaultUpdate` alias by
+    /// config order (last wins): `skipFetchAll=true` followed by
+    /// `skipDefaultUpdate=false` FETCHES. A primary-wins read would wrongly
+    /// skip here and pick a Basic git lacking `remote-https` for a real
+    /// HTTPS fetch. Exercised against real git ordering (no network).
+    #[cfg(unix)]
+    #[gpui::test]
+    async fn test_skip_fetch_all_legacy_alias_last_wins(cx: &mut TestAppContext) {
+        disable_git_global_config();
+        cx.executor().allow_parking();
+        let repo_dir = tempfile::tempdir().unwrap();
+        git_init_repo(repo_dir.path());
+        git_command(
+            repo_dir.path(),
+            [
+                "remote",
+                "add",
+                "origin",
+                "https://github.com/example/origin.git",
+            ],
+        );
+        // File order is the assertion: primary first, alias last.
+        git_command(
+            repo_dir.path(),
+            ["config", "--add", "remote.origin.skipFetchAll", "true"],
+        );
+        git_command(
+            repo_dir.path(),
+            ["config", "--add", "remote.origin.skipDefaultUpdate", "false"],
+        );
+        let repo = RealGitRepository::new(
+            &repo_dir.path().join(".git"),
+            None,
+            Some("git".into()),
+            cx.executor(),
+        )
+        .unwrap();
+        let env = test_commit_envs();
+        assert!(
+            !repo.remote_skip_fetch_all("origin", &env).await,
+            "trailing skipDefaultUpdate=false must win over skipFetchAll=true (fetch it)"
+        );
+    }
+
+    /// Mirror image: `skipDefaultUpdate=true` followed by
+    /// `skipFetchAll=false` also FETCHES (primary last wins). Exercised
+    /// against real git ordering (no network).
+    #[cfg(unix)]
+    #[gpui::test]
+    async fn test_skip_fetch_all_primary_last_wins(cx: &mut TestAppContext) {
+        disable_git_global_config();
+        cx.executor().allow_parking();
+        let repo_dir = tempfile::tempdir().unwrap();
+        git_init_repo(repo_dir.path());
+        git_command(
+            repo_dir.path(),
+            [
+                "remote",
+                "add",
+                "origin",
+                "https://github.com/example/origin.git",
+            ],
+        );
+        // File order is the assertion: alias first, primary last.
+        git_command(
+            repo_dir.path(),
+            ["config", "--add", "remote.origin.skipDefaultUpdate", "true"],
+        );
+        git_command(
+            repo_dir.path(),
+            ["config", "--add", "remote.origin.skipFetchAll", "false"],
+        );
+        let repo = RealGitRepository::new(
+            &repo_dir.path().join(".git"),
+            None,
+            Some("git".into()),
+            cx.executor(),
+        )
+        .unwrap();
+        let env = test_commit_envs();
+        assert!(
+            !repo.remote_skip_fetch_all("origin", &env).await,
+            "trailing skipFetchAll=false must win over skipDefaultUpdate=true (fetch it)"
         );
     }
 
